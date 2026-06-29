@@ -595,6 +595,9 @@ async fn main() -> anyhow::Result<()> {
         (String::new(), false)
     };
 
+    // Apply the user-configured request timeout (issue #175) before building any
+    // client so the Anthropic client and all providers honour it.
+    claurst_api::set_request_timeout_secs(config.resolve_request_timeout_secs_active());
     let client_config = claurst_api::client::ClientConfig {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
@@ -1230,6 +1233,8 @@ async fn refresh_provider_runtime_state(
         .resolve_anthropic_auth_async()
         .await
         .unwrap_or((String::new(), false));
+    // Apply the user-configured request timeout (issue #175) before rebuilding.
+    claurst_api::set_request_timeout_secs(config.resolve_request_timeout_secs_active());
     let client_config = claurst_api::client::ClientConfig {
         api_key,
         api_base: config.resolve_anthropic_api_base(),
@@ -1697,8 +1702,14 @@ async fn run_interactive(
 
 
     // Set up terminal
-    let mut terminal = setup_terminal()?;
+    let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Gate input shift-normalization on whether the terminal speaks the kitty
+    // keyboard protocol (detected in setup_terminal). On terminals that don't —
+    // Windows conhost / CMD / legacy PowerShell, etc. — printable keys already
+    // arrive as their final character, so re-shifting them would corrupt input
+    // (issue #183: typing `/` produced `?`).
+    app.kitty_keyboard_active = claurst_tui::keyboard_enhancement_active();
     if let Some(warning) = resume_warning {
         app.status_message = Some(warning);
     }
@@ -2385,7 +2396,9 @@ async fn run_interactive(
                                             eprintln!("\nLogin failed: {}", e);
                                         }
                                     }
-                                    terminal = claurst_tui::setup_terminal()?;
+                                    terminal = claurst_tui::setup_terminal(app.config.mouse_capture_enabled())?;
+                                    app.kitty_keyboard_active =
+                                        claurst_tui::keyboard_enhancement_active();
                                 }
                                 Some(CommandResult::StartLoginForProvider {
                                     provider,
@@ -2450,7 +2463,9 @@ async fn run_interactive(
                                             }
                                         }
                                     }
-                                    terminal = claurst_tui::setup_terminal()?;
+                                    terminal = claurst_tui::setup_terminal(app.config.mouse_capture_enabled())?;
+                                    app.kitty_keyboard_active =
+                                        claurst_tui::keyboard_enhancement_active();
                                 }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));

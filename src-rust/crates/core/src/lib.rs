@@ -651,6 +651,11 @@ pub mod config {
         100  // 100 KB
     }
 
+    /// Default total request timeout (seconds) when the user has not configured
+    /// one. Generous so slow local models (CPU inference, large MoE) that can
+    /// take several minutes to first token are not cut off prematurely.
+    pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+
     /// Definition of a named agent with per-agent model, permissions,
     /// temperature, and system prompt.
     pub fn api_key_env_vars_for_provider(provider_id: &str) -> &'static [&'static str] {
@@ -900,6 +905,17 @@ pub mod config {
         /// Provider-specific options (passed through to provider implementation)
         #[serde(default)]
         pub options: HashMap<String, serde_json::Value>,
+        /// Total request timeout in seconds for this provider's HTTP client.
+        /// Overrides the global [`Config::request_timeout_secs`] when set.
+        /// Useful for slow local models (CPU inference, large MoE) that can take
+        /// several minutes to first token. `None` falls back to the global value.
+        #[serde(
+            default,
+            rename = "requestTimeoutSecs",
+            alias = "request_timeout_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub request_timeout_secs: Option<u64>,
     }
 
     impl Default for ProviderConfig {
@@ -911,6 +927,7 @@ pub mod config {
                 models_whitelist: Vec::new(),
                 models_blacklist: Vec::new(),
                 options: HashMap::new(),
+                request_timeout_secs: None,
             }
         }
     }
@@ -995,6 +1012,26 @@ pub mod config {
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
         #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
+        /// Total request timeout in seconds applied to provider HTTP clients.
+        /// Slow local models (CPU inference, large MoE) can take several minutes
+        /// to first token; raise this to avoid premature cut-off. `None` (or 0)
+        /// uses [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Per-provider overrides live on
+        /// [`ProviderConfig::request_timeout_secs`].
+        #[serde(
+            default,
+            rename = "requestTimeoutSecs",
+            alias = "request_timeout_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub request_timeout_secs: Option<u64>,
+        /// Whether app-level mouse capture is enabled. `None` (default) or
+        /// `Some(true)` means claurst captures the mouse for scroll / right-click
+        /// context menu / middle-click paste / drag text-selection. Set
+        /// `"mouseCapture": false` to release the mouse to the terminal so native
+        /// click-drag selection and copy/paste work without lag (issue #104).
+        /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
+        #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
+        pub mouse_capture: Option<bool>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1233,6 +1270,14 @@ pub mod config {
     }
 
     impl Config {
+        /// Whether app-level mouse capture should be enabled. Defaults to `true`
+        /// (capture on) when unset, preserving historical behaviour; users opt out
+        /// via `"mouseCapture": false` to restore native terminal text selection
+        /// and copy/paste (issue #104).
+        pub fn mouse_capture_enabled(&self) -> bool {
+            self.mouse_capture.unwrap_or(true)
+        }
+
         pub fn selected_provider_id(&self) -> &str {
             self.provider
                 .as_deref()
@@ -1468,6 +1513,25 @@ pub mod config {
             self.resolve_provider_api_base(self.selected_provider_id())
                 .unwrap_or_else(|| self.resolve_anthropic_api_base())
         }
+
+        /// Resolve the total request timeout (in seconds) for `provider_id`.
+        ///
+        /// Precedence: per-provider [`ProviderConfig::request_timeout_secs`] >
+        /// global [`Config::request_timeout_secs`] > [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+        /// Zero values are treated as unset.
+        pub fn resolve_request_timeout_secs(&self, provider_id: &str) -> u64 {
+            self.provider_configs
+                .get(provider_id)
+                .and_then(|provider| provider.request_timeout_secs)
+                .filter(|&secs| secs > 0)
+                .or_else(|| self.request_timeout_secs.filter(|&secs| secs > 0))
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS)
+        }
+
+        /// Resolve the request timeout for the active provider.
+        pub fn resolve_request_timeout_secs_active(&self) -> u64 {
+            self.resolve_request_timeout_secs(self.selected_provider_id())
+        }
     }
 
     impl Settings {
@@ -1679,11 +1743,13 @@ pub mod config {
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
+                mouse_capture: over.config.mouse_capture.or(base.config.mouse_capture),
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
+                request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
             };
             Self {
                 config: merged_config,
@@ -1792,6 +1858,92 @@ pub mod config {
             }
         }
         result
+    }
+
+    #[cfg(test)]
+    mod request_timeout_tests {
+        use super::*;
+
+        #[test]
+        fn defaults_to_600_when_unset() {
+            let config = Config::default();
+            assert_eq!(config.request_timeout_secs, None);
+            assert_eq!(
+                config.resolve_request_timeout_secs("openai"),
+                DEFAULT_REQUEST_TIMEOUT_SECS
+            );
+            assert_eq!(DEFAULT_REQUEST_TIMEOUT_SECS, 600);
+        }
+
+        #[test]
+        fn global_request_timeout_serde_roundtrips_with_camelcase_key() {
+            let mut config = Config::default();
+            config.request_timeout_secs = Some(1800);
+            // Serialises with the documented camelCase key.
+            let json = serde_json::to_string(&config).expect("serialise");
+            assert!(
+                json.contains("\"requestTimeoutSecs\":1800"),
+                "expected camelCase key in: {json}"
+            );
+            // Round-trips back and threads through the resolver.
+            let parsed: Config = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(parsed.request_timeout_secs, Some(1800));
+            assert_eq!(parsed.resolve_request_timeout_secs("ollama"), 1800);
+        }
+
+        #[test]
+        fn snake_case_alias_also_parses() {
+            // Patch a fully-serialised config to use the snake_case alias and
+            // confirm it still deserialises (back-compat with snake_case keys).
+            let mut value =
+                serde_json::to_value(Config::default()).expect("to_value");
+            let obj = value.as_object_mut().unwrap();
+            obj.remove("requestTimeoutSecs");
+            obj.insert(
+                "request_timeout_secs".to_string(),
+                serde_json::json!(900),
+            );
+            let parsed: Config =
+                serde_json::from_value(value).expect("alias should parse");
+            assert_eq!(parsed.request_timeout_secs, Some(900));
+        }
+
+        #[test]
+        fn per_provider_override_wins_over_global() {
+            let mut config = Config::default();
+            config.request_timeout_secs = Some(1200);
+            let mut provider = ProviderConfig::default();
+            provider.request_timeout_secs = Some(3600);
+            config
+                .provider_configs
+                .insert("ollama".to_string(), provider);
+            // Per-provider override applies to ollama.
+            assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
+            // Other providers fall back to the global value.
+            assert_eq!(config.resolve_request_timeout_secs("openai"), 1200);
+        }
+
+        #[test]
+        fn effective_config_merges_top_level_provider_timeout() {
+            let mut settings = Settings::default();
+            settings.config.request_timeout_secs = Some(1200);
+            let mut provider = ProviderConfig::default();
+            provider.request_timeout_secs = Some(3600);
+            settings.providers.insert("ollama".to_string(), provider);
+            let config = settings.effective_config();
+            assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
+            assert_eq!(config.resolve_request_timeout_secs("openai"), 1200);
+        }
+
+        #[test]
+        fn zero_is_treated_as_unset() {
+            let mut config = Config::default();
+            config.request_timeout_secs = Some(0);
+            assert_eq!(
+                config.resolve_request_timeout_secs("openai"),
+                DEFAULT_REQUEST_TIMEOUT_SECS
+            );
+        }
     }
 }
 
@@ -4120,6 +4272,44 @@ mod tests {
     }
 
     // ---- Config tests -------------------------------------------------------
+
+    #[test]
+    fn test_config_mouse_capture_defaults_on() {
+        // Unset (None) must read as enabled to preserve historical behaviour.
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.mouse_capture, None);
+        assert!(cfg.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_mouse_capture_explicit_off() {
+        let mut cfg = crate::config::Config::default();
+        cfg.mouse_capture = Some(false);
+        assert!(!cfg.mouse_capture_enabled());
+        cfg.mouse_capture = Some(true);
+        assert!(cfg.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_mouse_capture_serde_roundtrip() {
+        // Unset round-trips as None and is omitted from the serialized JSON
+        // (skip_serializing_if), so existing settings files stay unchanged.
+        let cfg = crate::config::Config::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("mouseCapture"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mouse_capture, None);
+        assert!(back.mouse_capture_enabled());
+
+        // Explicit off serializes the key and round-trips as disabled.
+        let mut cfg = crate::config::Config::default();
+        cfg.mouse_capture = Some(false);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"mouseCapture\":false"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mouse_capture, Some(false));
+        assert!(!back.mouse_capture_enabled());
+    }
 
     #[test]
     fn test_config_effective_model_default() {

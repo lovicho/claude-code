@@ -390,12 +390,25 @@ struct MessageLinesCache {
     lines: Vec<RenderedLineItem>,
 }
 
-/// Cache key for completed messages only (no ptr — len change = new message).
+/// Cache key for the *committed prefix* served during streaming: all messages
+/// before the live (actively-streaming) turn.
+///
+/// Deliberately keyed by message/annotation identity — NOT by
+/// `transcript_version`, which bumps on every streaming token and would churn
+/// the entry away each frame (issue #222). During streaming the committed
+/// messages do not change, so `messages_ptr`/`messages_len` stay stable and the
+/// prefix is a cache hit every frame; when the committed set changes (a turn
+/// completes, session switch/fork/revert/compaction) the pointer, length, or
+/// `prefix_len` shifts and the entry is rebuilt. `prefix_len` is the number of
+/// committed messages that precede the live turn, so growing the transcript by
+/// one turn re-keys the prefix cleanly.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CompletedMsgCacheKey {
     width: u16,
-    transcript_version: u64,
+    prefix_len: usize,
+    messages_ptr: usize,
     messages_len: usize,
+    annotations_ptr: usize,
     annotations_len: usize,
     thinking_expanded_len: usize,
 }
@@ -408,8 +421,53 @@ struct CompletedMsgCache {
 
 thread_local! {
     static MESSAGE_LINES_CACHE: RefCell<Option<MessageLinesCache>> = const { RefCell::new(None) };
-    /// Stores rendered lines for committed messages only; valid even during streaming.
+    /// Stores rendered lines for the committed prefix (all messages before the
+    /// live turn); valid and reused across streaming deltas.
     static COMPLETED_MSG_CACHE: RefCell<Option<CompletedMsgCache>> = const { RefCell::new(None) };
+}
+
+// Instrumentation so tests can prove the committed prefix is served from cache
+// (a hit) rather than rebuilt on every streaming frame. Compiled out of release
+// builds.
+#[cfg(test)]
+thread_local! {
+    static PREFIX_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PREFIX_CACHE_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_prefix_cache_hit() {
+    PREFIX_CACHE_HITS.with(|c| c.set(c.get() + 1));
+}
+#[cfg(test)]
+fn record_prefix_cache_miss() {
+    PREFIX_CACHE_MISSES.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn record_prefix_cache_hit() {}
+#[cfg(not(test))]
+#[inline(always)]
+fn record_prefix_cache_miss() {}
+
+/// Test-only: `(hits, misses)` for the committed-prefix cache.
+#[cfg(test)]
+fn prefix_cache_counts() -> (u64, u64) {
+    (
+        PREFIX_CACHE_HITS.with(|c| c.get()),
+        PREFIX_CACHE_MISSES.with(|c| c.get()),
+    )
+}
+
+/// Test-only: reset the render caches and counters so a test starts clean and
+/// is not affected by cache state left over from a previous render on this
+/// thread.
+#[cfg(test)]
+fn reset_render_caches() {
+    MESSAGE_LINES_CACHE.with(|c| *c.borrow_mut() = None);
+    COMPLETED_MSG_CACHE.with(|c| *c.borrow_mut() = None);
+    PREFIX_CACHE_HITS.with(|c| c.set(0));
+    PREFIX_CACHE_MISSES.with(|c| c.set(0));
 }
 
 // -----------------------------------------------------------------------
@@ -1058,6 +1116,11 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let content_height = lines.len() as u16;
     let visible_height = msg_area.height;  // no borders, full height available
     let max_scroll = content_height.saturating_sub(visible_height) as usize;
+    // Publish the max meaningful scroll offset so the next scroll event can
+    // clamp `scroll_offset` against it (the content height is only known here,
+    // at render time). Prevents unbounded inflation when scrolling past the top
+    // (#223).
+    app.last_max_scroll.set(max_scroll);
     // scroll_offset counts lines above the bottom (0 = at bottom).
     // ratatui scroll() takes an absolute top-row index, so convert:
     //   top_row = max_scroll - scroll_offset  (clamped to [0, max_scroll])
@@ -1210,12 +1273,11 @@ fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width
 fn append_turn_items(
     items: &mut Vec<RenderedLineItem>,
     turn: &TranscriptTurn<'_>,
-    width: u16,
-    tool_names: &std::collections::HashMap<String, String>,
-    expanded_thinking: &std::collections::HashSet<u64>,
+    ctx: &RenderContext,
     frame_count: u64,
     accent: Color,
 ) {
+    let width = ctx.width;
     push_rendered_items(
         items,
         render_transcript_user_message(turn.user_message, turn.metadata, width),
@@ -1230,16 +1292,7 @@ fn append_turn_items(
 
     let mut sections: Vec<(SectionContent, Option<usize>)> = Vec::new();
     for (message_index, message) in &turn.assistant_messages {
-        let tagged = render_transcript_assistant_message_tagged(
-            message,
-            &RenderContext {
-                width,
-                highlight: true,
-                show_thinking: false,
-                tool_names: tool_names.clone(),
-                expanded_thinking: expanded_thinking.clone(),
-            },
-        );
+        let tagged = render_transcript_assistant_message_tagged(message, ctx);
         if !tagged.is_empty() {
             sections.push((SectionContent::Tagged(tagged), Some(*message_index)));
         }
@@ -1308,6 +1361,99 @@ fn append_turn_items(
     push_blank_item(items);
 }
 
+/// Append rendered items for the transcript messages in `[start, end)` to
+/// `items`, mirroring the single linear pass used by the full transcript build.
+///
+/// System annotations are emitted at the top of each landed index exactly as
+/// the full pass does; `emit_end_annotations` additionally flushes the
+/// annotations anchored at `end` (used when `end` is the true message count so
+/// trailing annotations are not lost).
+///
+/// Splitting the pass at a turn boundary is byte-identical to building the whole
+/// range in one shot: `range(0, k, false)` followed by `range(k, total, true)`
+/// produces exactly the same items as `range(0, total, true)` whenever `k` is an
+/// index the linear pass lands on (i.e. a turn's user index). This is what lets
+/// the streaming path serve the committed prefix from cache and rebuild only the
+/// live tail without any risk of ghosting.
+#[allow(clippy::too_many_arguments)]
+fn build_message_items_range(
+    app: &App,
+    width: u16,
+    ctx: &RenderContext,
+    turn_map: &std::collections::HashMap<usize, &TranscriptTurn<'_>>,
+    start: usize,
+    end: usize,
+    emit_end_annotations: bool,
+    items: &mut Vec<RenderedLineItem>,
+) {
+    let mut index = start;
+    while index < end {
+        for ann in app.system_annotations.iter().filter(|ann| ann.after_index == index) {
+            let mut lines = Vec::new();
+            render_system_annotation_lines(&mut lines, ann, width as usize);
+            push_rendered_items(items, lines, None, false);
+        }
+
+        let message = &app.messages[index];
+        if message.role == Role::User {
+            if let Some(&turn) = turn_map.get(&index) {
+                append_turn_items(items, turn, ctx, app.frame_count, app.accent_color);
+                index = turn.end_message_index + 1;
+                continue;
+            }
+        }
+
+        let tagged = render_transcript_assistant_message_tagged(message, ctx);
+        push_rendered_items_tagged(items, tagged, Some(index));
+        push_blank_item(items);
+        index += 1;
+    }
+
+    if emit_end_annotations {
+        for ann in app.system_annotations.iter().filter(|ann| ann.after_index == end) {
+            let mut lines = Vec::new();
+            render_system_annotation_lines(&mut lines, ann, width as usize);
+            push_rendered_items(items, lines, None, false);
+        }
+    }
+}
+
+/// Build the full transcript item list from scratch (no caching). Used for the
+/// non-streaming path, the streaming fallback, and as the correctness reference
+/// in tests.
+fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
+    // Build `tool_names` and the render context ONCE per rebuild and lend them
+    // to every message renderer (issue #222).
+    let tool_names = build_tool_names(&app.messages);
+    let ctx = RenderContext {
+        width,
+        highlight: true,
+        show_thinking: false,
+        tool_names: &tool_names,
+        expanded_thinking: &app.thinking_expanded,
+    };
+    let turns = build_transcript_turns(app);
+    let mut turn_map = std::collections::HashMap::new();
+    for turn in &turns {
+        turn_map.insert(turn.user_index, turn);
+    }
+
+    let total = app.messages.len();
+    let mut items = Vec::new();
+    build_message_items_range(app, width, &ctx, &turn_map, 0, total, true, &mut items);
+
+    if total == 0 && !app.tool_use_blocks.is_empty() {
+        for block in &app.tool_use_blocks {
+            let mut lines = Vec::new();
+            render_tool_block_lines(&mut lines, block, app.frame_count);
+            push_rendered_items(&mut items, lines, None, false);
+            push_blank_item(&mut items);
+        }
+    }
+
+    items
+}
+
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     let streaming = app.is_streaming
         || !app.streaming_text.is_empty()
@@ -1317,6 +1463,13 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         .iter()
         .any(|block| block.status == ToolStatus::Running);
     let cacheable = !streaming && !has_running_tool_blocks;
+
+    if !cacheable {
+        // Live content is on screen. Instead of re-rendering the whole backlog
+        // every frame (the O(messages^2) hot path from issue #222), serve the
+        // committed prefix from cache and rebuild only the live tail.
+        return render_streaming_items(app, width);
+    }
 
     // Fast path: nothing live — use the full-result cache (ptr-stable check).
     let full_key = MessageLinesCacheKey {
@@ -1328,125 +1481,98 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    if cacheable {
-        if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .as_ref()
-                .filter(|c| c.key == full_key)
-                .map(|c| c.lines.clone())
-        }) {
-            return lines;
-        }
+    if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.key == full_key)
+            .map(|c| c.lines.clone())
+    }) {
+        return lines;
     }
 
-    let completed_key = CompletedMsgCacheKey {
+    let items = build_all_items(app, width);
+    MESSAGE_LINES_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(MessageLinesCache {
+            key: full_key,
+            lines: items.clone(),
+        });
+    });
+    items
+}
+
+/// Render the transcript while there is live content on screen.
+///
+/// The only part of the transcript that changes between streaming frames is the
+/// last turn (its live text/thinking and any running tool blocks). Every earlier
+/// turn is already committed and byte-identical to a full rebuild, so we serve
+/// that committed prefix from `COMPLETED_MSG_CACHE` and rebuild only the live
+/// tail. Because `build_message_items_range` splits the exact same linear pass
+/// at a turn boundary, `prefix ++ tail` is identical to `build_all_items` — no
+/// ghosting, no missing content.
+fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
+    let tool_names = build_tool_names(&app.messages);
+    let ctx = RenderContext {
         width,
-        transcript_version: app.transcript_version.get(),
-        messages_len: app.messages.len(),
+        highlight: true,
+        show_thinking: false,
+        tool_names: &tool_names,
+        expanded_thinking: &app.thinking_expanded,
+    };
+    let turns = build_transcript_turns(app);
+
+    // The live tail is the last turn; its user index is the prefix boundary.
+    // Without a turn (e.g. tool-blocks-only welcome state) there is no stable
+    // prefix to reuse, so fall back to a full rebuild.
+    let split_idx = match turns.last() {
+        Some(last) => last.user_index,
+        None => return build_all_items(app, width),
+    };
+
+    let mut turn_map = std::collections::HashMap::new();
+    for turn in &turns {
+        turn_map.insert(turn.user_index, turn);
+    }
+
+    let total = app.messages.len();
+    let prefix_key = CompletedMsgCacheKey {
+        width,
+        prefix_len: split_idx,
+        messages_ptr: app.messages.as_ptr() as usize,
+        messages_len: total,
+        annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    let build_items = || {
-        let tool_names = build_tool_names(&app.messages);
-        let turns = build_transcript_turns(app);
-        let mut turn_map = std::collections::HashMap::new();
-        for turn in &turns {
-            turn_map.insert(turn.user_index, turn);
-        }
 
-        let mut items = Vec::new();
-        let total = app.messages.len();
-        let mut index = 0usize;
-        while index <= total {
-            for ann in app.system_annotations.iter().filter(|ann| ann.after_index == index) {
-                let mut lines = Vec::new();
-                render_system_annotation_lines(&mut lines, ann, width as usize);
-                push_rendered_items(&mut items, lines, None, false);
-            }
-
-            if index >= total {
-                break;
-            }
-
-            let message = &app.messages[index];
-            if message.role == Role::User {
-                if let Some(&turn) = turn_map.get(&index) {
-                    append_turn_items(
-                        &mut items,
-                        turn,
-                        width,
-                        &tool_names,
-                        &app.thinking_expanded,
-                        app.frame_count,
-                        app.accent_color,
-                    );
-                    index = turn.end_message_index + 1;
-                    continue;
-                }
-            }
-
-            let tagged = render_transcript_assistant_message_tagged(
-                message,
-                &RenderContext {
-                    width,
-                    highlight: true,
-                    show_thinking: false,
-                    tool_names: tool_names.clone(),
-                    expanded_thinking: app.thinking_expanded.clone(),
-                },
-            );
-            push_rendered_items_tagged(&mut items, tagged, Some(index));
-            push_blank_item(&mut items);
-            index += 1;
-        }
-
-        if total == 0 && !app.tool_use_blocks.is_empty() {
-            for block in &app.tool_use_blocks {
-                let mut lines = Vec::new();
-                render_tool_block_lines(&mut lines, block, app.frame_count);
-                push_rendered_items(&mut items, lines, None, false);
-                push_blank_item(&mut items);
-            }
-        }
-
-        items
-    };
-    let completed_lines: Vec<RenderedLineItem> = if cacheable {
-        if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .as_ref()
-                .filter(|c| c.key == completed_key)
-                .map(|c| c.lines.clone())
-        }) {
-            lines
-        } else {
-            let items = build_items();
-            COMPLETED_MSG_CACHE.with(|cache| {
-                *cache.borrow_mut() = Some(CompletedMsgCache {
-                    key: completed_key,
-                    lines: items.clone(),
-                });
-            });
-            items
-        }
+    // Committed prefix: messages before the live turn. Stable across streaming
+    // deltas, so keyed by identity (not `transcript_version`) and served from
+    // cache every frame after the first.
+    let mut items = if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.key == prefix_key)
+            .map(|c| c.lines.clone())
+    }) {
+        record_prefix_cache_hit();
+        lines
     } else {
-        build_items()
-    };
-
-    // If there is no live content, store in the full cache and return.
-    if cacheable {
-        MESSAGE_LINES_CACHE.with(|cache| {
-            *cache.borrow_mut() = Some(MessageLinesCache {
-                key: full_key,
-                lines: completed_lines.clone(),
+        record_prefix_cache_miss();
+        let mut prefix = Vec::new();
+        build_message_items_range(app, width, &ctx, &turn_map, 0, split_idx, false, &mut prefix);
+        COMPLETED_MSG_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some(CompletedMsgCache {
+                key: prefix_key,
+                lines: prefix.clone(),
             });
         });
-        return completed_lines;
-    }
+        prefix
+    };
 
-    completed_lines
+    // Live tail: the actively-streaming turn, rebuilt fresh every frame.
+    build_message_items_range(app, width, &ctx, &turn_map, split_idx, total, true, &mut items);
+    items
 }
 
 // â”€â”€ Welcome / startup screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2740,13 +2866,11 @@ fn render_legacy_history_search(
                 .map(String::as_str)
                 .unwrap_or("");
 
-            let truncated = if UnicodeWidthStr::width(entry) > (dialog_width as usize - 6) {
-                let mut s = entry.to_string();
-                s.truncate(dialog_width as usize - 9);
-                format!("{}\u{2026}", s)
-            } else {
-                entry.to_string()
-            };
+            // truncate_end is width-aware, cuts on char boundaries, and appends
+            // its own ellipsis. The old code did `String::truncate` on a raw
+            // byte index (panics mid-codepoint) after a `usize` subtraction that
+            // could underflow-panic on a narrow terminal (#221).
+            let truncated = truncate_end(entry, (dialog_width as usize).saturating_sub(6));
 
             let (prefix, style) = if is_selected {
                 (
@@ -3184,5 +3308,236 @@ mod tool_block_tests {
         assert!(joined.contains("[ ] Wire adapter"), "pending marker: {joined:?}");
         // The raw result-preview string must NOT leak into the checklist view.
         assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
+    }
+
+    #[test]
+    fn legacy_history_search_narrow_multibyte_no_panic() {
+        use crate::app::{App, HistorySearch};
+        use claurst_core::config::Config;
+        use claurst_core::cost::CostTracker;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.prompt_input.history = vec!["\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(6)]; // wide CJK
+        let mut hs = HistorySearch::new();
+        hs.matches = vec![0];
+
+        // width 10 -> dialog_width 6 -> `dialog_width - 9` underflow-panicked
+        // pre-fix, and `String::truncate` on a byte index sliced the CJK entry
+        // mid-codepoint (#221). No panic == pass.
+        let mut terminal = Terminal::new(TestBackend::new(10, 12)).unwrap();
+        terminal
+            .draw(|frame| render_legacy_history_search(frame, &hs, &app, frame.area()))
+            .unwrap();
+    }
+}
+
+/// Tests for the streaming transcript cache (issue #222): the committed prefix
+/// must be reused across streaming deltas, and streaming output must be
+/// byte-identical to a full (non-cached) rebuild.
+#[cfg(test)]
+mod stream_cache_tests {
+    use super::*;
+    use crate::app::App;
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use claurst_core::types::Message;
+
+    const WIDTH: u16 = 80;
+
+    fn test_app() -> App {
+        App::new(Config::default(), CostTracker::new())
+    }
+
+    /// A per-item signature that captures the rendered spans+styles (via Debug)
+    /// plus all metadata, so equality means byte-identical rendering.
+    fn item_sig(item: &RenderedLineItem) -> (String, bool, Option<usize>, Option<u64>) {
+        (
+            format!("{:?}", item.line),
+            item.is_header,
+            item.message_index,
+            item.thinking_hash,
+        )
+    }
+
+    fn sigs(items: &[RenderedLineItem]) -> Vec<(String, bool, Option<usize>, Option<u64>)> {
+        items.iter().map(item_sig).collect()
+    }
+
+    fn joined_text(items: &[RenderedLineItem]) -> String {
+        items
+            .iter()
+            .map(|i| i.search_text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The completed-message items are reused (served from cache) across a
+    /// streaming delta, while the live tail updates.
+    #[test]
+    fn completed_prefix_reused_across_streaming_delta() {
+        let mut app = test_app();
+        // Turn 0 is fully committed; turn 1 is the live/streaming turn.
+        app.messages.push(Message::user("user one prompt"));
+        app.messages.push(Message::assistant("assistant one committed reply"));
+        app.messages.push(Message::user("user two prompt"));
+        app.is_streaming = true;
+        app.streaming_text = "streaming tail alpha".to_string();
+
+        reset_render_caches();
+
+        // First render: prefix is built fresh (a miss).
+        let render1 = render_message_items(&app, WIDTH);
+        assert_eq!(prefix_cache_counts(), (0, 1), "first render builds the prefix");
+
+        // A streaming delta arrives: only the live text grows. Real code bumps
+        // transcript_version on every delta — assert that does NOT evict the
+        // committed-prefix entry.
+        app.streaming_text.push_str(" beta");
+        app.invalidate_transcript();
+
+        let render2 = render_message_items(&app, WIDTH);
+        let (hits, misses) = prefix_cache_counts();
+        assert_eq!(
+            (hits, misses),
+            (1, 1),
+            "committed prefix served from cache after the delta (no rebuild)"
+        );
+
+        // The committed content is identical in both renders and appears before
+        // the live tail diverges.
+        let sig1 = sigs(&render1);
+        let sig2 = sigs(&render2);
+        let common = sig1
+            .iter()
+            .zip(sig2.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(common > 0, "some leading items must be identical");
+        let leading_text = joined_text(&render1[..common]);
+        assert!(
+            leading_text.contains("user one prompt")
+                && leading_text.contains("assistant one committed reply"),
+            "the reused prefix contains the whole committed turn: {leading_text:?}"
+        );
+        // The reused prefix must not contain any live tail content.
+        assert!(
+            !leading_text.contains("streaming tail alpha"),
+            "prefix must not include the live tail: {leading_text:?}"
+        );
+
+        // The live tail updated between renders.
+        let text1 = joined_text(&render1);
+        let text2 = joined_text(&render2);
+        assert!(text1.contains("streaming tail alpha"));
+        assert!(!text1.contains("streaming tail alpha beta"));
+        assert!(text2.contains("streaming tail alpha beta"), "tail rebuilt with the delta");
+    }
+
+    /// Streaming render (cached prefix + rebuilt tail) is byte-identical to a
+    /// full rebuild for a multi-message transcript — no ghosting, no missing or
+    /// stale content — both on the first (cold) frame and after a delta (warm).
+    #[test]
+    fn streaming_render_matches_full_rebuild() {
+        let mut app = test_app();
+        app.messages.push(Message::user("first user question"));
+        app.messages.push(Message::assistant("first assistant answer with **markdown**"));
+        app.messages.push(Message::user("second user question"));
+        app.messages.push(Message::assistant("second assistant answer"));
+        app.messages.push(Message::user("third user question"));
+        app.is_streaming = true;
+        app.streaming_thinking = "pondering the third answer".to_string();
+        app.streaming_text = "third answer so far".to_string();
+
+        reset_render_caches();
+
+        // Cold frame: streaming path vs a direct full rebuild.
+        let streamed_cold = render_message_items(&app, WIDTH);
+        let full_cold = build_all_items(&app, WIDTH);
+        assert_eq!(
+            sigs(&streamed_cold),
+            sigs(&full_cold),
+            "cold streaming render must match a full rebuild"
+        );
+
+        // Warm frame: after a delta, the prefix is served from cache but the
+        // concatenation must still equal a full rebuild.
+        app.streaming_text.push_str(" plus more tokens");
+        app.invalidate_transcript();
+        let streamed_warm = render_message_items(&app, WIDTH);
+        let (hits, _) = prefix_cache_counts();
+        assert!(hits >= 1, "warm frame served the prefix from cache");
+        let full_warm = build_all_items(&app, WIDTH);
+        assert_eq!(
+            sigs(&streamed_warm),
+            sigs(&full_warm),
+            "warm streaming render must match a full rebuild"
+        );
+    }
+
+    /// Swapping the transcript (session switch / fork / revert / compaction)
+    /// must NOT serve a stale committed prefix, even mid-stream.
+    #[test]
+    fn transcript_swap_does_not_ghost_stale_prefix() {
+        let mut app = test_app();
+        app.messages.push(Message::user("session A user"));
+        app.messages.push(Message::assistant("session A assistant reply"));
+        app.messages.push(Message::user("session A live turn"));
+        app.is_streaming = true;
+        app.streaming_text = "A tail".to_string();
+
+        reset_render_caches();
+        let render_a = render_message_items(&app, WIDTH);
+        assert!(joined_text(&render_a).contains("session A assistant reply"));
+
+        // Swap in a different transcript (new Vec) while still streaming. The
+        // prefix cache must be re-keyed by identity, so no session-A content
+        // leaks through.
+        app.messages = vec![
+            Message::user("session B user"),
+            Message::assistant("session B assistant reply"),
+            Message::user("session B live turn"),
+        ];
+        app.streaming_text = "B tail".to_string();
+        app.invalidate_transcript();
+
+        let render_b = render_message_items(&app, WIDTH);
+        let text_b = joined_text(&render_b);
+        assert!(text_b.contains("session B assistant reply"), "shows swapped content");
+        assert!(
+            !text_b.contains("session A"),
+            "no stale session-A content ghosts through: {text_b:?}"
+        );
+        // And the swapped render equals a full rebuild.
+        assert_eq!(sigs(&render_b), sigs(&build_all_items(&app, WIDTH)));
+    }
+
+    /// The last message toggling streaming -> completed moves cleanly into the
+    /// cached (non-streaming) set with identical content.
+    #[test]
+    fn streaming_to_completed_transition_is_clean() {
+        let mut app = test_app();
+        app.messages.push(Message::user("q1"));
+        app.messages.push(Message::assistant("a1 committed"));
+        app.messages.push(Message::user("q2"));
+        app.is_streaming = true;
+        app.streaming_text = "live answer body".to_string();
+
+        reset_render_caches();
+        let _streaming = render_message_items(&app, WIDTH);
+
+        // Commit the streamed message (as flush_streamed_assistant_message would)
+        // and end streaming.
+        app.messages.push(Message::assistant("live answer body"));
+        app.is_streaming = false;
+        app.streaming_text.clear();
+        app.invalidate_transcript();
+
+        let completed = render_message_items(&app, WIDTH);
+        // Non-streaming render equals a full rebuild (correct committed set).
+        assert_eq!(sigs(&completed), sigs(&build_all_items(&app, WIDTH)));
+        let text = joined_text(&completed);
+        assert!(text.contains("a1 committed"));
+        assert!(text.contains("live answer body"));
     }
 }

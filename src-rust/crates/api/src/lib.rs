@@ -36,6 +36,10 @@ pub mod auth;
 pub mod stream_parser;
 pub mod transform;
 
+// Wire-format protocol layer (#228): request-building + stream decoding owned
+// once per wire format, shared across the providers that speak it.
+pub mod protocol;
+
 // Provider registry (Phase 1C).
 pub mod registry;
 
@@ -65,8 +69,11 @@ pub use provider_error::ProviderError;
 // Phase 1B re-exports — provider abstraction traits.
 pub use provider::{LlmProvider, ModelInfo};
 pub use auth::{AuthProvider, LoginFlow};
-pub use stream_parser::{StreamParser, SseStreamParser, JsonLinesStreamParser};
+pub use stream_parser::{SseByteDecoder, StreamParser, SseStreamParser, JsonLinesStreamParser};
 pub use transform::MessageTransformer;
+
+// #228 protocol layer re-exports.
+pub use protocol::{LineStreamDecoder, OpenAiChatDecoder};
 
 // Phase 1C re-exports — provider registry.
 pub use registry::ProviderRegistry;
@@ -1103,6 +1110,17 @@ pub mod client {
             }
         }
 
+        // TODO(#228): this SSE loop + `frame_to_event` below are the decode half
+        // of the **AnthropicMessages** wire protocol. They should be hoisted into
+        // a sans-IO `protocol::anthropic_messages` decoder (mirroring
+        // `protocol::openai_chat::OpenAiChatDecoder`) and shared with
+        // `providers::anthropic::AnthropicProvider`, collapsing the two Anthropic
+        // stacks. Remaining step / risk: this path decodes into the Anthropic-typed
+        // `AnthropicStreamEvent` consumed by `StreamHandler`/`StreamAccumulator`
+        // and the TUI, whereas the protocol decoders emit the provider-agnostic
+        // `provider_types::StreamEvent`; unifying requires either a decoder generic
+        // over its output event or migrating those consumers. Deferred to keep the
+        // TUI and all tests green.
         /// Read an SSE byte stream, parse frames, and emit `AnthropicStreamEvent`s.
         async fn process_sse_stream(
             resp: wreq::Response,
@@ -1112,30 +1130,16 @@ pub mod client {
             use sse_parser::SseLineParser;
 
             let mut parser = SseLineParser::new();
+            // Shared byte-buffering decoder (#228): buffers raw bytes and only
+            // decodes complete lines, so a multibyte codepoint split across a
+            // network chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
             let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-                let text = String::from_utf8_lossy(&chunk);
 
-                // Prepend any leftover from the previous chunk
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                // Split into lines.  If the chunk doesn't end with a newline
-                // the last piece is an incomplete line – stash it.
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for line in lines {
+                for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
                     if let Some(frame) = parser.feed_line(line) {
                         if let Some(event) =

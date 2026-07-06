@@ -1094,6 +1094,11 @@ pub struct App {
     pub total_message_lines: Cell<usize>,
     /// Scroll offset from the last render frame (used for selection validation).
     pub last_render_scroll_offset: Cell<u16>,
+    /// Maximum `scroll_offset` (lines above the bottom) from the last render.
+    /// Written by the renderer, which is the only place the full content height
+    /// is known; read back on the next scroll event to clamp `scroll_offset` so
+    /// scrolling up past the top can't inflate it unboundedly (#223).
+    pub last_max_scroll: Cell<usize>,
 
     // ---- Text selection state --------------------------------------------
     /// Selection drag anchor (col, row) — set on mouse-down.
@@ -1474,6 +1479,7 @@ impl App {
             message_row_map: RefCell::new(std::collections::HashMap::new()),
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
+            last_max_scroll: Cell::new(0),
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
@@ -2678,6 +2684,22 @@ impl App {
         }
         self.refresh_prompt_input();
         input
+    }
+
+    /// Scroll the transcript up by `amount` lines and disable auto-follow.
+    ///
+    /// `scroll_offset` counts lines above the bottom (0 = pinned to the newest
+    /// content). It is clamped to `last_max_scroll` — the maximum meaningful
+    /// offset from the last render — so scrolling up past the top of the
+    /// transcript can't inflate it unboundedly. Without the clamp, an over-scroll
+    /// would leave `scroll_offset` far above `max_scroll`, and the user would
+    /// have to press Down that many times before the view moved (#223).
+    fn scroll_up_by(&mut self, amount: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(amount)
+            .min(self.last_max_scroll.get());
+        self.auto_scroll = false;
     }
 
     /// Compute the number of lines to scroll per wheel/trackpad event.
@@ -4414,9 +4436,13 @@ impl App {
             }
 
             // ---- Submit ------------------------------------------------
-            // Shift+Enter / Alt+Enter / Ctrl+Enter insert a literal newline
-            // so users can compose multi-line prompts before sending
-            // (issue #149 follow-up).
+            // Fallback newline insertion for when the keybinding layer doesn't
+            // claim a modified Enter (e.g. Ctrl+Enter, or Shift/Alt+Enter after
+            // the user unbinds them): Shift+Enter / Alt+Enter / Ctrl+Enter
+            // insert a literal newline so users can compose multi-line prompts
+            // before sending (issue #149 / #224). The authoritative bindings
+            // live in claurst_core::keybindings (shift+enter, alt+enter, ctrl+j
+            // → newline; enter → submit) and are handled above at the resolver.
             KeyCode::Enter
                 if !self.is_streaming
                     && (key.modifiers.contains(KeyModifiers::SHIFT)
@@ -4450,8 +4476,7 @@ impl App {
             // ---- Message boundary navigation (Alt+Up/Alt+Down) ----------
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
                 // Jump up by ~20 lines (approximate message boundary).
-                self.scroll_offset = self.scroll_offset.saturating_add(20);
-                self.auto_scroll = false;
+                self.scroll_up_by(20);
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 // Jump down by ~20 lines (approximate message boundary).
@@ -4499,9 +4524,8 @@ impl App {
 
             // ---- Scroll ------------------------------------------------
             KeyCode::PageUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                // Scrolling up disables auto-follow.
-                self.auto_scroll = false;
+                // Scrolling up disables auto-follow (handled by scroll_up_by).
+                self.scroll_up_by(10);
             }
             KeyCode::PageDown => {
                 let new_off = self.scroll_offset.saturating_sub(10);
@@ -5011,8 +5035,7 @@ impl App {
                 false
             }
             "scrollUp" => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                self.auto_scroll = false;
+                self.scroll_up_by(10);
                 false
             }
             "scrollDown" => {
@@ -5113,8 +5136,7 @@ impl App {
             }
             "previousMessage" => {
                 // Alt+←: Navigate to previous message in transcript
-                self.scroll_offset = self.scroll_offset.saturating_add(5);
-                self.auto_scroll = false;
+                self.scroll_up_by(5);
                 false
             }
             "nextMessage" => {
@@ -5847,8 +5869,7 @@ impl App {
                 // Don't consume Ctrl+Scroll — let the terminal handle zoom.
                 if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
                     let step = self.scroll_step();
-                    self.scroll_offset = self.scroll_offset.saturating_add(step);
-                    self.auto_scroll = false;
+                    self.scroll_up_by(step);
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -6639,12 +6660,59 @@ mod tests {
     #[test]
     fn mouse_events_processed_when_capture_enabled() {
         // Default config leaves mouse capture on, so a scroll wheel event
-        // should move the scroll offset.
+        // should move the scroll offset — provided there is content to scroll
+        // over (a render must have established a non-zero max_scroll).
         let mut app = make_app();
         assert!(app.config.mouse_capture_enabled());
         assert_eq!(app.scroll_offset, 0);
+        app.last_max_scroll.set(50);
         app.handle_mouse_event(scroll_up_event());
         assert!(app.scroll_offset > 0, "scroll should advance when capture is on");
+        assert!(app.scroll_offset <= 50, "scroll stays within max_scroll");
+    }
+
+    // ---- scroll_offset clamping (issue #223) ----
+
+    #[test]
+    fn scroll_up_offset_clamped_to_max_scroll() {
+        let mut app = make_app();
+        // A render established that the transcript is 5 lines taller than the
+        // viewport, so scroll_offset can meaningfully range over 0..=5.
+        app.last_max_scroll.set(5);
+
+        // Scroll up far past the top, many times.
+        for _ in 0..50 {
+            app.scroll_up_by(10);
+        }
+
+        // Without the clamp scroll_offset would be 500; it must stay at
+        // max_scroll so the offset can't inflate unboundedly (#223).
+        assert_eq!(
+            app.scroll_offset, 5,
+            "scroll_offset must not inflate past max_scroll"
+        );
+        assert!(!app.auto_scroll, "scrolling up disables auto-follow");
+
+        // Because it was clamped, a single Down step moves the view
+        // immediately instead of burning through hundreds of wasted presses.
+        let before = app.scroll_offset;
+        app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        assert!(
+            app.scroll_offset < before,
+            "a single Down moves the view once scroll_offset is clamped"
+        );
+    }
+
+    #[test]
+    fn scroll_up_no_op_when_nothing_to_scroll() {
+        // When content fits the viewport (max_scroll == 0) scrolling up is a
+        // no-op rather than silently inflating scroll_offset.
+        let mut app = make_app();
+        app.last_max_scroll.set(0);
+        for _ in 0..20 {
+            app.scroll_up_by(10);
+        }
+        assert_eq!(app.scroll_offset, 0, "no scroll room means no offset growth");
     }
 
     #[test]
@@ -6823,6 +6891,87 @@ mod tests {
 
         assert!(should_submit);
         assert_eq!(app.prompt_input.text, "/theme");
+    }
+
+    // ---- Shift+Enter newline vs Enter submit (issue #224) ----
+
+    /// Feed some text then a modified Enter and return (submitted?, buffer).
+    fn type_then_modified_enter(mods: KeyModifiers) -> (bool, String) {
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, mods));
+        (submitted, app.prompt_input.text.clone())
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_not_submit() {
+        // On kitty-capable terminals Shift+Enter arrives as Enter+SHIFT and must
+        // insert a literal newline, leaving the prompt multi-line and unsent.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::SHIFT);
+        assert!(!submitted, "Shift+Enter must not submit");
+        assert_eq!(text, "hi\n", "Shift+Enter should append a newline");
+        assert!(text.contains('\n'), "buffer should now be multi-line");
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline_fallback() {
+        // Alt+Enter is a fallback for terminals that can't report Shift+Enter.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::ALT);
+        assert!(!submitted, "Alt+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_enter_inserts_newline_fallback() {
+        // Ctrl+Enter is the Windows-Terminal-style fallback for newline.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::CONTROL);
+        assert!(!submitted, "Ctrl+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline_fallback() {
+        // Ctrl+J (Char('j') + CONTROL) is the conventional legacy newline escape
+        // (pi binds insert-newline to shift+enter + ctrl+j). It must insert a
+        // newline, not the literal character 'j'.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(!submitted, "Ctrl+J must not submit");
+        assert_eq!(app.prompt_input.text, "hi\n", "Ctrl+J should insert a newline, not 'j'");
+    }
+
+    #[test]
+    fn bare_enter_submits_without_newline() {
+        // A plain Enter (no modifiers) submits and leaves the buffer untouched.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(submitted, "bare Enter should submit");
+        assert_eq!(app.prompt_input.text, "hi", "bare Enter must not insert a newline");
+        assert!(!app.prompt_input.text.contains('\n'));
+    }
+
+    #[test]
+    fn shift_enter_newline_composes_multiline_prompt() {
+        // Compose two lines with Shift+Enter between them, then submit with a
+        // bare Enter; the buffer keeps both lines and only the bare Enter sends.
+        let mut app = make_app();
+        for c in "line1".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(!app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::SHIFT)));
+        for c in "line2".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.prompt_input.text, "line1\nline2");
+        assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
     }
 
     #[test]

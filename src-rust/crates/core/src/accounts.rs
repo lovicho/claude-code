@@ -122,6 +122,7 @@ impl AccountRegistry {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            set_user_only_dir_perms(parent);
         }
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, json)?;
@@ -278,15 +279,34 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// Tighten permissions on credential files (best-effort, Unix-only).
+/// Tighten permissions on a credential/session file so only the owner can
+/// read or write it (mode `0o600`). Best-effort and Unix-only; a no-op on
+/// other platforms (Windows ACLs are out of scope). Shared across modules
+/// that persist tokens, credentials, or session transcripts (issue #212).
 #[allow(unused_variables)]
-fn set_user_only_perms(path: &std::path::Path) {
+pub(crate) fn set_user_only_perms(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(path) {
             let mut perms = meta.permissions();
             perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
+/// Tighten permissions on a directory that holds credentials/session data so
+/// only the owner can traverse or list it (mode `0o700`). Best-effort and
+/// Unix-only; a no-op on other platforms (issue #212).
+#[allow(unused_variables)]
+pub(crate) fn set_user_only_dir_perms(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
             let _ = std::fs::set_permissions(path, perms);
         }
     }
@@ -445,5 +465,83 @@ mod tests {
         assert_eq!(p.display_name(), "kuber@example.com");
         p.label = Some("Personal".into());
         assert_eq!(p.display_name(), "Personal");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #212: credential/session files must be owner-only (0o600) and
+    // their parent dirs owner-only (0o700). Unix-only; a no-op elsewhere.
+    // -----------------------------------------------------------------------
+
+    /// The shared helper actually tightens a permissive file down to 0o600.
+    #[cfg(unix)]
+    #[test]
+    fn set_user_only_perms_forces_file_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oauth_tokens.json");
+        std::fs::write(&path, "{\"access_token\":\"secret\"}").unwrap();
+        // Start deliberately world/group readable to prove we lock it down.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        set_user_only_perms(&path);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "token file must be owner-only");
+    }
+
+    /// The dir helper tightens a permissive directory down to 0o700.
+    #[cfg(unix)]
+    #[test]
+    fn set_user_only_dir_perms_forces_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("accounts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        set_user_only_dir_perms(&dir);
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "account dir must be owner-only");
+    }
+
+    /// End-to-end: the real codex token save path produces a 0o600 file under
+    /// a 0o700 account dir. Redirects `dirs::home_dir()` via a temp `HOME`,
+    /// serialized against any other HOME-mutating test in this binary.
+    #[cfg(unix)]
+    #[test]
+    fn real_codex_save_path_writes_0600_token_file() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+        static HOME_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let tokens = crate::oauth_config::CodexTokens {
+            access_token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            account_id: Some("acc_1".into()),
+            expires_at: Some(0),
+        };
+        let save_res = crate::oauth_config::save_codex_tokens_for_profile(&tokens, "work");
+
+        let path = codex_token_path("work");
+        let file_mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .map(|m| m.permissions().mode() & 0o777);
+
+        // Restore HOME before asserting so a failure can't leak the override
+        // into the rest of the test binary.
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        save_res.unwrap();
+        assert_eq!(file_mode.unwrap(), 0o600, "codex token file must be owner-only");
+        assert_eq!(dir_mode.unwrap(), 0o700, "codex account dir must be owner-only");
     }
 }

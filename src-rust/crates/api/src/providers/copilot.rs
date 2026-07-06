@@ -900,11 +900,18 @@ impl LlmProvider for CopilotProvider {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 
+        // TODO(#228): Copilot speaks the OpenAI-Chat wire format and could reuse
+        // `protocol::openai_chat::OpenAiChatDecoder`, except it surfaces reasoning
+        // as `ReasoningDelta { index: 0 }` (no dedicated Thinking block). Migrate
+        // once that decoder gains a "simple reasoning" mode; keeping this loop is
+        // behavior-preserving until then.
         let s = stream! {
             use futures::StreamExt;
 
             let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
+            // Shared byte-buffering decoder (#228): complete lines only, so a
+            // multibyte codepoint straddling a chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
 
             let mut message_started = false;
             let mut message_id = String::from("unknown");
@@ -927,21 +934,7 @@ impl LlmProvider for CopilotProvider {
                     }
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for line in lines {
+                for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r').trim();
 
                     if line.is_empty() || line.starts_with(':') {

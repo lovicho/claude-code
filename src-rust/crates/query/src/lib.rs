@@ -18,6 +18,7 @@ pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod sanitize;
 pub mod session_memory;
 pub mod skill_prefetch;
 pub use agent_tool::{AgentTool, init_team_swarm_runner};
@@ -27,12 +28,15 @@ pub use goal_loop::{GoalContinuation, StopReason, check_and_continue_goal, mark_
 pub use skill_prefetch::{
     SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
 };
+pub use sanitize::sanitize_history;
 pub use compact::{
     AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
-    compact_conversation, context_collapse, context_window_for_model, format_compact_summary,
-    get_compact_prompt, group_messages_for_compact, micro_compact_if_needed,
-    reactive_compact, should_auto_compact, should_compact, should_context_collapse, snip_compact,
+    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
+    context_window_for_model, format_compact_summary, get_compact_prompt,
+    group_messages_for_compact, micro_compact_if_needed, reactive_compact,
+    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
+    should_context_collapse, snip_compact,
 };
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
@@ -46,7 +50,7 @@ use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
-use claurst_tools::{Tool, ToolContext, ToolResult};
+use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -713,7 +717,40 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
      you were doing. Pick up mid-thought if that is where the cut happened. \
      Break remaining work into smaller pieces.";
 
+/// Content stored in the synthetic `tool_result` for a tool that was abandoned
+/// mid-flight because the query loop was cancelled (issue #218). Every
+/// outstanding `tool_use` still receives a matching `tool_result` carrying this
+/// text so the message history stays well-formed.
+const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
+
 // Spinner verbs are imported from claurst_core::spinner
+
+/// Apply the outcome of a reactive-compact / context-collapse call to the live
+/// message list, preserving the conversation when compaction fails.
+///
+/// Fixes #213: the reactive paths used to `std::mem::take(messages)` before
+/// calling `compact::reactive_compact` / `compact::context_collapse`. That left
+/// `*messages` empty, and on ANY failure (API error, `Cancelled`, empty
+/// summary) the drained messages were never restored — silently destroying the
+/// live conversation. Here we only overwrite `*messages` when compaction
+/// returns `Ok`; on `Err` the original messages are left completely untouched,
+/// so a failed compaction can never wipe the session.
+///
+/// Returns `Ok(tokens_freed)` on success, or the original error on failure.
+fn apply_compact_result<E>(
+    messages: &mut Vec<Message>,
+    outcome: Result<compact::CompactResult, E>,
+) -> Result<u64, E> {
+    match outcome {
+        Ok(result) => {
+            let tokens_freed = result.tokens_freed;
+            *messages = result.messages;
+            Ok(tokens_freed)
+        }
+        // Failure: leave `*messages` untouched so the conversation survives.
+        Err(e) => Err(e),
+    }
+}
 
 /// Run the agentic query loop.
 ///
@@ -735,6 +772,15 @@ pub async fn run_query_loop(
     cancel_token: tokio_util::sync::CancellationToken,
     mut pending_messages: Option<&mut Vec<String>>,
 ) -> QueryOutcome {
+    // Rebind the tool context to carry the loop's actual cancel token so the
+    // parallel tool executor — and any tools or sub-agents that read
+    // `ctx.cancel_token` — observe the same cancellation signal that drives this
+    // loop (issue #218). Callers construct the context with a placeholder token;
+    // making the loop authoritative here means a parent cancel reaches tools.
+    let mut loop_ctx = tool_ctx.clone();
+    loop_ctx.cancel_token = cancel_token.clone();
+    let tool_ctx = &loop_ctx;
+
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
     // Tracks how many consecutive max_tokens recoveries we've attempted so
@@ -858,6 +904,17 @@ pub async fn run_query_loop(
                 }
             }
         }
+
+        // Request-boundary invariant pass (issue #229 / MI-2). Compaction,
+        // max_tokens recovery, and the command-queue / pending-message drains
+        // above can each independently leave the history with a broken
+        // tool_use ↔ tool_result pairing (an orphan result, or a dangling
+        // tool_use) that the provider rejects with HTTP 400. Heal it here —
+        // the single choke point covering BOTH the legacy Anthropic path
+        // (`api_messages` below) and the modern provider path (`provider_messages`
+        // built later in the dispatch branch), since both derive from `messages`.
+        // sanitize_history is idempotent, so a well-formed history is untouched.
+        *messages = sanitize::sanitize_history(std::mem::take(messages));
 
         // Build API request
         let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
@@ -1187,6 +1244,10 @@ pub async fn run_query_loop(
                     let provider_stall = tokio::time::sleep(provider_stall_timeout);
                     tokio::pin!(provider_stall);
                     let mut provider_stream_stalled = false;
+                    // Set when the stream yields a mid-stream `Err`. The
+                    // accumulated text/tool-calls are then incomplete and MUST
+                    // NOT be assembled into a "completed" turn (issue #215).
+                    let mut provider_stream_error: Option<String> = None;
 
                     loop {
                         tokio::select! {
@@ -1203,6 +1264,7 @@ pub async fn run_query_loop(
                                     None => break,
                                     Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                        provider_stream_error = Some(e.to_string());
                                         break;
                                     }
                                     Some(Ok(evt)) => {
@@ -1277,6 +1339,44 @@ pub async fn run_query_loop(
                         continue;
                     }
 
+                    // A mid-stream error means the accumulated text and
+                    // tool-call JSON are incomplete/untrustworthy. Do NOT fall
+                    // through to assemble and execute tools from a truncated
+                    // stream (issue #215 — an Edit/Write could otherwise run
+                    // with empty `{}` args). Mirror the Anthropic branch's
+                    // retry semantics: retry the turn if retries remain,
+                    // otherwise surface the failure as a QueryOutcome::Error.
+                    if let Some(err) = provider_stream_error {
+                        if retries_left > 0 {
+                            retries_left -= 1;
+                            warn!(
+                                provider = %provider_id_str,
+                                model = %model_id_str,
+                                retries_left,
+                                error = %err,
+                                "Provider stream error — retrying turn"
+                            );
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::Status(format!(
+                                    "Stream error — retrying ({} left)…",
+                                    retries_left + 1
+                                )));
+                            }
+                            turn -= 1;
+                            continue;
+                        }
+                        error!(
+                            provider = %provider_id_str,
+                            model = %model_id_str,
+                            error = %err,
+                            "Provider stream error — retries exhausted; aborting turn"
+                        );
+                        return QueryOutcome::Error(ClaudeError::Api(format!(
+                            "Provider '{}' stream error (model '{}'): {}",
+                            provider_id_str, model_id_str, err
+                        )));
+                    }
+
                     // Build the content blocks from accumulated stream data.
                     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
@@ -1298,10 +1398,31 @@ pub async fn run_query_loop(
                     // Reconstruct tool-use blocks (sorted by index for determinism).
                     let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
                     tc_indices.sort();
+                    // Tool calls whose accumulated JSON arguments failed to
+                    // parse. We still emit a tool_use block (so the assistant
+                    // message stays well-formed and every tool_use has a
+                    // matching tool_result), but we must NOT execute the tool
+                    // with empty/garbage input — instead we surface a tool
+                    // error to the model so it can retry (issue #215).
+                    let mut malformed_tool_calls: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     for idx in tc_indices {
                         if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
-                            let input: serde_json::Value = serde_json::from_str(&json_str)
-                                .unwrap_or(serde_json::json!({}));
+                            let input = match parse_tool_args(&json_str) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(
+                                        provider = %provider_id_str,
+                                        tool = %name,
+                                        tool_id = %id,
+                                        error = %e,
+                                        "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
+                                    );
+                                    malformed_tool_calls.insert(id.clone());
+                                    // Placeholder input — this call is never executed.
+                                    serde_json::json!({})
+                                }
+                            };
                             content_blocks.push(ContentBlock::ToolUse { id, name, input });
                         }
                     }
@@ -1348,7 +1469,17 @@ pub async fn run_query_loop(
                                     input_json: tool_input.to_string(),
                                 });
                             }
-                            let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
+                            let result = if malformed_tool_calls.contains(&tool_id) {
+                                // Never execute a tool whose arguments could not
+                                // be parsed — return an error the model can see
+                                // and recover from (issue #215).
+                                ToolResult::error(format!(
+                                    "Tool call '{}' was not executed: its arguments were malformed or truncated JSON. Retry the tool call with complete, valid JSON arguments.",
+                                    tool_name
+                                ))
+                            } else {
+                                execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await
+                            };
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
                                     tool_name: tool_name.clone(),
@@ -1618,15 +1749,27 @@ pub async fn run_query_loop(
             }
         }
 
+        // Resolve the effective context window ONCE per turn for the active
+        // provider+model. Prefer the models.dev-backed registry value (correct
+        // for every provider — 1M Gemini/GPT windows, 32k local models) and
+        // fall back to the Claude-centric heuristic only when the registry has
+        // no usable entry. All threshold logic below keys off this. (#216)
+        let context_window = compact::resolve_context_window(
+            config.model_registry.as_deref(),
+            tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
+            &config.model,
+        );
+
         // Emit token warning events when approaching context limits.
         // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
         {
-            let warning_state =
-                compact::calculate_token_warning_state(usage.input_tokens, &config.model);
+            let warning_state = compact::calculate_token_warning_state_for_window(
+                usage.input_tokens,
+                context_window,
+            );
             if warning_state != compact::TokenWarningState::Ok {
                 if let Some(ref tx) = event_tx {
-                    let window = compact::context_window_for_model(&config.model);
-                    let pct_used = usage.input_tokens as f64 / window as f64;
+                    let pct_used = usage.input_tokens as f64 / context_window as f64;
                     let _ = tx.send(QueryEvent::TokenWarning {
                         state: warning_state,
                         pct_used,
@@ -1649,58 +1792,50 @@ pub async fn run_query_loop(
 
         if reactive_compact_enabled {
             // Reactive path: emergency collapse takes priority over normal compact.
-            let context_limit = compact::context_window_for_model(&config.model);
+            let context_limit = context_window;
             if compact::should_context_collapse(usage.input_tokens, context_limit) {
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status(
                         "Compacting context... (emergency collapse)".to_string(),
                     ));
                 }
-                match compact::context_collapse(
-                    std::mem::take(messages),
-                    client,
-                    config,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        *messages = result.messages;
-                        info!(
-                            tokens_freed = result.tokens_freed,
-                            "Context-collapse complete"
-                        );
+                // Pass a clone so the live conversation survives a failed
+                // compaction; `*messages` is only overwritten on success (#213).
+                let outcome =
+                    compact::context_collapse(messages.clone(), client, config).await;
+                match apply_compact_result(messages, outcome) {
+                    Ok(tokens_freed) => {
+                        info!(tokens_freed, "Context-collapse complete");
                     }
                     Err(e) => {
-                        warn!(error = %e, "Context-collapse failed");
-                        // Put messages back on failure (mem::take drained them).
-                        // We can't recover them here — re-run auto-compact as fallback.
+                        // `*messages` is left untouched — the conversation is intact.
+                        warn!(error = %e, "Context-collapse failed; conversation preserved");
                     }
                 }
             } else if compact::should_compact(usage.input_tokens, context_limit) {
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
                 }
-                match compact::reactive_compact(
-                    std::mem::take(messages),
+                // Pass a clone so the live conversation survives a failed
+                // compaction; `*messages` is only overwritten on success (#213).
+                let outcome = compact::reactive_compact(
+                    messages.clone(),
                     client,
                     config,
                     cancel_token.clone(),
                     &[],
                 )
-                .await
-                {
-                    Ok(result) => {
-                        *messages = result.messages;
-                        info!(
-                            tokens_freed = result.tokens_freed,
-                            "Reactive compact complete"
-                        );
+                .await;
+                match apply_compact_result(messages, outcome) {
+                    Ok(tokens_freed) => {
+                        info!(tokens_freed, "Reactive compact complete");
                     }
+                    // `*messages` is left untouched on both failure arms below.
                     Err(claurst_core::error::ClaudeError::Cancelled) => {
-                        warn!("Reactive compact was cancelled");
+                        warn!("Reactive compact was cancelled; conversation preserved");
                     }
                     Err(e) => {
-                        warn!(error = %e, "Reactive compact failed");
+                        warn!(error = %e, "Reactive compact failed; conversation preserved");
                     }
                 }
             }
@@ -1711,6 +1846,7 @@ pub async fn run_query_loop(
                 messages,
                 usage.input_tokens,
                 &config.model,
+                context_window,
                 &mut compact_state,
             )
             .await
@@ -2026,37 +2162,48 @@ pub async fn run_query_loop(
                     })
                     .collect();
 
-                // Run all tool futures concurrently; join_all preserves order.
-                let exec_results: Vec<ToolResult> =
-                    futures::future::join_all(exec_futures).await;
+                // Run all tool futures concurrently, but race the batch against the
+                // loop's cancel token (issue #218): on cancellation the in-flight
+                // tools are abandoned promptly instead of blocking until the
+                // slowest one finishes, and a cancelled ToolResult is synthesized
+                // for EVERY tool so each tool_use still gets a matching tool_result
+                // and the message history stays well-formed.
+                let (exec_results, batch_cancelled) =
+                    run_tool_batch(exec_futures, &tool_ctx.cancel_token).await;
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
+                // When the batch was cancelled we skip the awaiting PostToolUse
+                // hooks (they run external commands and would defeat the point of
+                // returning promptly) but still emit ToolEnd + build every result
+                // block so the conversation and TUI stay consistent.
                 let mut result_blocks: Vec<ContentBlock> =
                     Vec::with_capacity(prepared.len());
                 for (p, result) in prepared.iter().zip(exec_results.into_iter()) {
-                    let hooks = &tool_ctx.config.hooks;
-                    let post_ctx = claurst_core::hooks::HookContext {
-                        event: "PostToolUse".to_string(),
-                        tool_name: Some(p.name.clone()),
-                        tool_input: Some(p.input.clone()),
-                        tool_output: Some(result.content.clone()),
-                        is_error: Some(result.is_error),
-                        session_id: Some(tool_ctx.session_id.clone()),
-                    };
-                    claurst_core::hooks::run_hooks(
-                        hooks,
-                        claurst_core::config::HookEvent::PostToolUse,
-                        &post_ctx,
-                        &tool_ctx.working_dir,
-                    )
-                    .await;
+                    if !batch_cancelled {
+                        let hooks = &tool_ctx.config.hooks;
+                        let post_ctx = claurst_core::hooks::HookContext {
+                            event: "PostToolUse".to_string(),
+                            tool_name: Some(p.name.clone()),
+                            tool_input: Some(p.input.clone()),
+                            tool_output: Some(result.content.clone()),
+                            is_error: Some(result.is_error),
+                            session_id: Some(tool_ctx.session_id.clone()),
+                        };
+                        claurst_core::hooks::run_hooks(
+                            hooks,
+                            claurst_core::config::HookEvent::PostToolUse,
+                            &post_ctx,
+                            &tool_ctx.working_dir,
+                        )
+                        .await;
 
-                    claurst_plugins::run_global_post_tool_hook(
-                        &p.name,
-                        &p.input,
-                        &result.content,
-                        result.is_error,
-                    );
+                        claurst_plugins::run_global_post_tool_hook(
+                            &p.name,
+                            &p.input,
+                            &result.content,
+                            result.is_error,
+                        );
+                    }
 
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::ToolEnd {
@@ -2074,8 +2221,15 @@ pub async fn run_query_loop(
                     });
                 }
 
-                // Append tool results as a user message
+                // Append tool results as a user message so the history remains
+                // valid (every tool_use is answered) even on cancellation.
                 messages.push(Message::user_blocks(result_blocks));
+
+                // If the batch was abandoned due to cancellation, stop the loop
+                // now rather than sending the (cancelled) results back to the model.
+                if batch_cancelled {
+                    return QueryOutcome::Cancelled;
+                }
 
                 // Continue the loop to send results back to the model
                 continue;
@@ -2121,6 +2275,45 @@ pub async fn run_query_loop(
     }
 }
 
+/// Parse the accumulated JSON arguments of a streamed tool call.
+///
+/// Providers stream a tool call's arguments as a sequence of partial-JSON
+/// deltas which we concatenate into a single buffer. A well-behaved
+/// no-argument call yields an empty (or whitespace-only) buffer, which we
+/// map to an empty object. Any *non-empty* buffer that fails to parse is
+/// returned as an error rather than being silently replaced with `{}` — a
+/// truncated stream must never cause a tool (e.g. Edit/Write) to run with
+/// empty arguments (issue #215).
+fn parse_tool_args(json_str: &str) -> Result<Value, serde_json::Error> {
+    let trimmed = json_str.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(trimmed)
+}
+
+/// Whether a `PermissionLevel` must be gated by the central backstop.
+///
+/// Only `None` and `ReadOnly` are exempt; every other level (`Write`,
+/// `Execute`, `Dangerous`, `Forbidden`) represents a side-effecting action that
+/// the backstop must confirm before it runs.
+fn permission_level_is_gated(level: PermissionLevel) -> bool {
+    !matches!(level, PermissionLevel::None | PermissionLevel::ReadOnly)
+}
+
+/// Synthesize a human-readable permission description for a tool that does not
+/// gate itself, surfacing the tool name and a truncated preview of its input so
+/// the user can see what is about to run.
+fn synthesize_permission_description(name: &str, input: &Value) -> String {
+    let rendered = serde_json::to_string(input).unwrap_or_default();
+    let preview: String = rendered.chars().take(200).collect();
+    if preview.is_empty() || preview == "{}" || preview == "null" {
+        format!("Run tool '{}'", name)
+    } else {
+        format!("Run tool '{}' with input: {}", name, preview)
+    }
+}
+
 /// Execute a single tool invocation.
 async fn execute_tool(
     name: &str,
@@ -2133,11 +2326,53 @@ async fn execute_tool(
     match tool {
         Some(tool) => {
             debug!(tool = name, "Executing tool");
+            // Central permission backstop (issue #210): if a tool does not gate
+            // itself (`self_gates() == false`) and requires a gated permission
+            // level, prompt here BEFORE executing. On denial, return a blocked
+            // result WITHOUT running the tool. Tools that already prompt
+            // internally opt out via `self_gates() == true` (no double-prompt),
+            // and read-only / no-permission tools are skipped. This makes a tool
+            // that forgets to gate itself secure by default.
+            if !tool.self_gates() && permission_level_is_gated(tool.permission_level()) {
+                let description = synthesize_permission_description(name, input);
+                if let Err(e) = ctx.check_permission(name, &description, false) {
+                    warn!(tool = name, "Tool blocked by central permission backstop");
+                    return ToolResult::error(e.to_string());
+                }
+            }
             tool.execute(input.clone(), ctx).await
         }
         None => {
             warn!(tool = name, "Unknown tool requested");
             ToolResult::error(format!("Unknown tool: {}", name))
+        }
+    }
+}
+
+/// Run a batch of tool-execution futures concurrently, abandoning them promptly
+/// if `cancel_token` fires (issue #218).
+///
+/// Returns exactly one `ToolResult` per input future, in order, plus a bool that
+/// is `true` iff the batch was cancelled before every tool finished. On the
+/// happy path (no cancellation) this is `join_all` and the results are the real
+/// tool outputs. On cancellation the in-flight futures are dropped (abandoned)
+/// and every position is filled with a synthetic cancelled `ToolResult` so the
+/// caller can still answer every `tool_use` and keep the message history valid.
+async fn run_tool_batch<F>(
+    exec_futures: Vec<F>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> (Vec<ToolResult>, bool)
+where
+    F: std::future::Future<Output = ToolResult>,
+{
+    let count = exec_futures.len();
+    tokio::select! {
+        results = futures::future::join_all(exec_futures) => (results, false),
+        _ = cancel_token.cancelled() => {
+            let cancelled = (0..count)
+                .map(|_| ToolResult::error(TOOL_CANCELLED_MSG))
+                .collect();
+            (cancelled, true)
         }
     }
 }
@@ -2310,6 +2545,61 @@ mod tests {
             agent_definition: None,
             model_registry: None,
             managed_agents: None,
+        }
+    }
+
+    // ---- parse_tool_args tests (issue #215) ---------------------------------
+
+    #[test]
+    fn test_parse_tool_args_valid_object() {
+        // A complete JSON object parses to the same value.
+        let v = parse_tool_args("{\"a\":1}").expect("valid JSON should parse");
+        assert_eq!(v, serde_json::json!({ "a": 1 }));
+
+        let v = parse_tool_args("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
+            .expect("valid JSON should parse");
+        assert_eq!(v["path"], "/tmp/x");
+        assert_eq!(v["content"], "hi");
+    }
+
+    #[test]
+    fn test_parse_tool_args_empty_is_empty_object() {
+        // No-argument tool calls arrive as an empty (or whitespace-only)
+        // buffer and must map to `{}` so the happy path still works.
+        assert_eq!(parse_tool_args("").unwrap(), serde_json::json!({}));
+        assert_eq!(parse_tool_args("   ").unwrap(), serde_json::json!({}));
+        assert_eq!(parse_tool_args("\n\t ").unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_parse_tool_args_truncated_is_error_not_empty_object() {
+        // The core of issue #215: a truncated/malformed stream must surface
+        // an error, NOT silently become `{}` (which would run Edit/Write with
+        // empty arguments).
+        assert!(
+            parse_tool_args("{\"a\":").is_err(),
+            "truncated JSON must be an error"
+        );
+        assert!(
+            parse_tool_args("{\"path\": \"/etc/passwd").is_err(),
+            "truncated string value must be an error"
+        );
+        assert!(
+            parse_tool_args("{not json}").is_err(),
+            "invalid JSON must be an error"
+        );
+
+        // Regression guard: the failing cases must never resolve to `{}`.
+        for bad in ["{\"a\":", "{\"path\": \"/etc/passwd", "{not json}"] {
+            let resolved = parse_tool_args(bad).unwrap_or(serde_json::json!({}));
+            // The OLD buggy behavior turned these into `{}`; assert we now
+            // *detect* the error rather than relying on that fallback.
+            assert!(
+                parse_tool_args(bad).is_err(),
+                "expected error for {:?}, but got {}",
+                bad,
+                resolved
+            );
         }
     }
 
@@ -2521,6 +2811,343 @@ mod tests {
         // both must be treated as OpenAI-compatible providers.
         assert!(is_openaiish_provider("alibaba"));
         assert!(is_openaiish_provider("qwen"));
+    }
+
+    // ---- apply_compact_result / #213 data-loss guard ------------------------
+
+    fn sample_conversation() -> Vec<Message> {
+        vec![
+            Message::user("initial user request"),
+            Message::assistant("assistant reply with important context"),
+            Message::user("follow-up question"),
+            Message::assistant("second assistant reply"),
+        ]
+    }
+
+    fn texts(messages: &[Message]) -> Vec<String> {
+        messages.iter().map(|m| m.get_all_text()).collect()
+    }
+
+    #[test]
+    fn failed_compaction_preserves_messages() {
+        // Regression test for #213: a failed compaction must NOT wipe the
+        // conversation. Previously the reactive path drained `messages` with
+        // std::mem::take and never restored them on error.
+        let mut messages = sample_conversation();
+        let before = texts(&messages);
+
+        // Simulate a failed reactive_compact / context_collapse (API error,
+        // Cancelled, empty summary all map to Err here).
+        let outcome: Result<compact::CompactResult, ClaudeError> =
+            Err(ClaudeError::Cancelled);
+        let result = apply_compact_result(&mut messages, outcome);
+
+        assert!(result.is_err(), "helper must surface the compaction error");
+        assert_eq!(
+            messages.len(),
+            before.len(),
+            "messages must not be emptied on failed compaction"
+        );
+        assert_eq!(
+            texts(&messages),
+            before,
+            "message contents must be identical after failed compaction"
+        );
+    }
+
+    #[test]
+    fn failed_compaction_with_generic_error_preserves_messages() {
+        // The helper is generic over the error type; any Err leaves messages
+        // untouched.
+        let mut messages = sample_conversation();
+        let before = texts(&messages);
+
+        let outcome: Result<compact::CompactResult, &str> = Err("empty summary");
+        let result = apply_compact_result(&mut messages, outcome);
+
+        assert_eq!(result, Err("empty summary"));
+        assert_eq!(texts(&messages), before);
+    }
+
+    #[test]
+    fn successful_compaction_replaces_messages() {
+        // On success the compacted result replaces the live messages and the
+        // freed-token count is returned.
+        let mut messages = sample_conversation();
+        let compacted = vec![
+            Message::user("[summary of earlier conversation]"),
+            Message::user("follow-up question"),
+        ];
+        let expected = texts(&compacted);
+
+        let outcome: Result<compact::CompactResult, ClaudeError> = Ok(compact::CompactResult {
+            messages: compacted,
+            summary: "[summary of earlier conversation]".to_string(),
+            tokens_freed: 4_096,
+        });
+        let result = apply_compact_result(&mut messages, outcome);
+
+        assert_eq!(
+            result.unwrap(),
+            4_096,
+            "tokens_freed must be surfaced on success"
+        );
+        assert_eq!(
+            texts(&messages),
+            expected,
+            "messages must be replaced with the compacted result on success"
+        );
+    }
+
+    // ---- Central permission backstop (issue #210) ---------------------------
+    //
+    // These tests pin the `execute_tool` backstop contract:
+    //  (a) a non-self-gating tool at a gated level is DENIED (never executes)
+    //      when the handler denies;
+    //  (b) a self-gating tool is NOT gated centrally (no double-prompt) — its
+    //      execute() runs even though the handler would deny;
+    //  (c) a ReadOnly / None tool is never gated centrally.
+
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// Permission handler that denies everything (returns `Ask`, which in a
+    /// non-interactive context surfaces as a hard denial).
+    struct DenyAllHandler;
+    impl claurst_core::permissions::PermissionHandler for DenyAllHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Ask {
+                reason: "denied by test handler".to_string(),
+            }
+        }
+        fn request_permission(
+            &self,
+            request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    /// A configurable mock tool that records whether its `execute()` ran.
+    struct MockTool {
+        name: &'static str,
+        level: PermissionLevel,
+        self_gates: bool,
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str { self.name }
+        fn description(&self) -> &str { "mock tool for backstop tests" }
+        fn permission_level(&self) -> PermissionLevel { self.level }
+        fn self_gates(&self) -> bool { self.self_gates }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            self.ran.store(true, AtomicOrdering::SeqCst);
+            ToolResult::success("mock ran")
+        }
+    }
+
+    fn deny_all_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::path::PathBuf::from("/workspace"),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(DenyAllHandler),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "backstop-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// (a) A tool that does NOT self-gate and requires a gated level (Execute)
+    /// is blocked by the central backstop when the handler denies — and its
+    /// `execute()` never runs.
+    #[tokio::test]
+    async fn backstop_denies_non_self_gating_gated_tool() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockExec",
+            level: PermissionLevel::Execute,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        let ctx = deny_all_context();
+
+        let result = execute_tool("MockExec", &serde_json::json!({}), &tools, &ctx).await;
+
+        assert!(result.is_error, "central backstop must block a denied tool");
+        assert!(
+            !ran.load(AtomicOrdering::SeqCst),
+            "execute() must NOT run when the backstop denies"
+        );
+    }
+
+    /// (b) A self-gating tool is NOT gated by the central backstop (no double
+    /// prompt): even with a deny-all handler, its `execute()` still runs
+    /// because the central gate is skipped for self-gaters.
+    #[tokio::test]
+    async fn backstop_skips_self_gating_tool() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockSelfGated",
+            level: PermissionLevel::Execute,
+            self_gates: true,
+            ran: ran.clone(),
+        })];
+        let ctx = deny_all_context();
+
+        let result = execute_tool("MockSelfGated", &serde_json::json!({}), &tools, &ctx).await;
+
+        assert!(
+            !result.is_error,
+            "self-gating tool must not be blocked by the central backstop"
+        );
+        assert_eq!(result.content, "mock ran");
+        assert!(
+            ran.load(AtomicOrdering::SeqCst),
+            "self-gating tool's execute() must run (central gate skipped)"
+        );
+    }
+
+    /// (c) ReadOnly and None tools are never gated centrally, so they run even
+    /// under a deny-all handler.
+    #[tokio::test]
+    async fn backstop_skips_read_only_and_none_tools() {
+        for level in [PermissionLevel::ReadOnly, PermissionLevel::None] {
+            let ran = Arc::new(AtomicBool::new(false));
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+                name: "MockSafe",
+                level,
+                self_gates: false,
+                ran: ran.clone(),
+            })];
+            let ctx = deny_all_context();
+
+            let result = execute_tool("MockSafe", &serde_json::json!({}), &tools, &ctx).await;
+
+            assert!(
+                !result.is_error,
+                "{:?} tool must not be gated centrally",
+                level
+            );
+            assert!(
+                ran.load(AtomicOrdering::SeqCst),
+                "{:?} tool's execute() must run",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn backstop_permission_level_gating_matrix() {
+        assert!(!permission_level_is_gated(PermissionLevel::None));
+        assert!(!permission_level_is_gated(PermissionLevel::ReadOnly));
+        assert!(permission_level_is_gated(PermissionLevel::Write));
+        assert!(permission_level_is_gated(PermissionLevel::Execute));
+        assert!(permission_level_is_gated(PermissionLevel::Dangerous));
+        assert!(permission_level_is_gated(PermissionLevel::Forbidden));
+    }
+
+    // ---- Issue #218: cancellation plumbing ---------------------------------
+
+    /// (a) The parallel tool executor (`run_tool_batch`, the exact code the query
+    /// loop runs) must abandon a long-running tool the moment the cancel token
+    /// fires: with a tool future that never completes and a pre-cancelled token,
+    /// the batch returns promptly instead of blocking, reports cancellation, and
+    /// still yields one cancelled `ToolResult` per tool so every `tool_use` can
+    /// be answered and the message history stays valid.
+    #[tokio::test]
+    async fn executor_abandons_in_flight_tools_on_cancel() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel(); // pre-cancelled
+
+        // Two tool futures: one that never completes (a long-running tool) and
+        // one that would succeed. Boxed so they share a concrete type.
+        let never: Pin<Box<dyn Future<Output = ToolResult> + Send>> =
+            Box::pin(std::future::pending());
+        let quick: Pin<Box<dyn Future<Output = ToolResult> + Send>> =
+            Box::pin(async { ToolResult::success("done") });
+
+        // If the executor blocked on the never-completing tool this would time
+        // out; it must return promptly instead.
+        let (results, cancelled) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_tool_batch(vec![never, quick], &cancel),
+        )
+        .await
+        .expect("executor must return promptly, not block on the pending tool");
+
+        assert!(cancelled, "batch must report that it was cancelled");
+        assert_eq!(
+            results.len(),
+            2,
+            "every tool_use must still receive a tool_result"
+        );
+        assert!(
+            results.iter().all(|r| r.is_error),
+            "cancelled tool results are errors"
+        );
+        assert!(
+            results[0].content.contains("cancelled"),
+            "cancelled result should say so, got: {}",
+            results[0].content
+        );
+    }
+
+    /// The happy path is unchanged: with a live (never-cancelled) token the batch
+    /// runs the futures to completion and returns their real results in order.
+    #[tokio::test]
+    async fn executor_runs_to_completion_without_cancel() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // `std::future::ready` gives both futures the same concrete type so they
+        // share a Vec (mirroring the Either-unified futures the real loop builds).
+        let f1 = std::future::ready(ToolResult::success("a"));
+        let f2 = std::future::ready(ToolResult::error("b"));
+
+        let (results, cancelled) = run_tool_batch(vec![f1, f2], &cancel).await;
+
+        assert!(!cancelled, "no cancellation should have occurred");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content, "a");
+        assert!(!results[0].is_error);
+        assert_eq!(results[1].content, "b");
+        assert!(results[1].is_error);
+    }
+
+    /// (b) A sub-agent receives a CHILD of the parent's cancel token — exactly
+    /// how `AgentTool` derives it from `ctx.cancel_token` — so cancelling the
+    /// parent query propagates into the sub-agent. `ToolContext` now exposes the
+    /// token, and cancelling it must flip the child.
+    #[test]
+    fn subagent_child_token_propagates_parent_cancel() {
+        let ctx = deny_all_context();
+        // AgentTool spawns each sub-agent with a token derived exactly this way.
+        let child = ctx.cancel_token.child_token();
+
+        assert!(!child.is_cancelled(), "child starts live");
+        ctx.cancel_token.cancel();
+        assert!(
+            child.is_cancelled(),
+            "cancelling the parent's token must cancel the sub-agent's child token"
+        );
     }
 }
 

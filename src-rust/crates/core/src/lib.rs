@@ -3278,9 +3278,13 @@ pub mod history {
     pub async fn save_session(session: &ConversationSession) -> anyhow::Result<()> {
         let dir = sessions_dir();
         tokio::fs::create_dir_all(&dir).await?;
+        crate::accounts::set_user_only_dir_perms(&dir);
         let path = dir.join(format!("{}.json", session.id));
         let content = serde_json::to_string_pretty(session)?;
         tokio::fs::write(&path, content).await?;
+        // Session transcripts can contain secrets pulled into context; keep
+        // them owner-only (issue #212).
+        crate::accounts::set_user_only_perms(&path);
         Ok(())
     }
 
@@ -3863,8 +3867,12 @@ pub mod oauth {
             let path = crate::accounts::anthropic_token_path(profile_id);
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
+                crate::accounts::set_user_only_dir_perms(parent);
             }
             tokio::fs::write(&path, serde_json::to_string_pretty(self)?).await?;
+            // These are live OAuth access + refresh tokens — never leave them
+            // world/group readable (issue #212).
+            crate::accounts::set_user_only_perms(&path);
             Ok(())
         }
 
@@ -4131,6 +4139,7 @@ pub mod tasks {
     use once_cell::sync::Lazy;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     /// Current status of a background task.
@@ -4170,6 +4179,11 @@ pub mod tasks {
         pub output: Vec<String>,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
+        /// Cancellation token for the task's in-process work loop. Signalling it
+        /// stops the running loop (e.g. a background sub-agent). Not persisted —
+        /// it holds no meaningful state across (de)serialization.
+        #[serde(skip)]
+        pub cancel_token: Option<CancellationToken>,
     }
 
     impl BackgroundTask {
@@ -4183,6 +4197,7 @@ pub mod tasks {
                 completed_at: None,
                 output: Vec::new(),
                 pid: None,
+                cancel_token: None,
             }
         }
 
@@ -4248,8 +4263,25 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Completed);
         }
 
-        /// Mark a task as `Cancelled`.  No-op if unknown or already terminal.
+        /// Attach a cancellation token to a task so it can later be signalled by
+        /// [`TaskRegistry::cancel`].  No-op if the ID is unknown.
+        pub fn set_cancel_token(&self, id: &str, token: CancellationToken) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                entry.cancel_token = Some(token);
+            }
+        }
+
+        /// Mark a task as `Cancelled` and signal its cancellation token (if any)
+        /// so the running work loop actually stops.  No-op if unknown or already
+        /// terminal.
         pub fn cancel(&self, id: &str) {
+            // Clone the token out from under the shard guard, then signal it once
+            // the guard has been dropped — never hold a DashMap lock across other
+            // registry operations (or any `.await`).
+            let token = self.tasks.get(id).and_then(|e| e.cancel_token.clone());
+            if let Some(token) = token {
+                token.cancel();
+            }
             self.update_status(id, TaskStatus::Cancelled);
         }
 
@@ -4906,5 +4938,81 @@ mod tests {
             assert!(preset.executor_model.contains('/'),
                 "Preset {} executor_model must be provider/model", preset.name);
         }
+    }
+
+    // ---- Background task cancellation (issue #219) --------------------------
+
+    /// Cancelling a task must signal the cancellation token attached to it, not
+    /// merely relabel its status. Without this, a "cancelled" background agent
+    /// keeps running and editing files.
+    #[test]
+    fn registry_cancel_signals_attached_token() {
+        use tokio_util::sync::CancellationToken;
+
+        let registry = tasks::TaskRegistry::new();
+        let id = registry.register(tasks::BackgroundTask::new("cancellable task"));
+
+        let token = CancellationToken::new();
+        registry.set_cancel_token(&id, token.clone());
+        assert!(!token.is_cancelled());
+
+        registry.cancel(&id);
+
+        assert!(
+            token.is_cancelled(),
+            "cancel() must signal the attached cancellation token"
+        );
+        assert_eq!(
+            registry.get(&id).unwrap().status,
+            tasks::TaskStatus::Cancelled
+        );
+    }
+
+    /// A running work loop that holds the registered token (as the background
+    /// sub-agent's `run_query_loop` does) must actually stop when the task is
+    /// cancelled through the registry.
+    #[tokio::test]
+    async fn spawned_loop_observes_registry_cancellation() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = tasks::TaskRegistry::new();
+        let mut task = tasks::BackgroundTask::new("bg loop");
+        let id = task.id.clone();
+        let token = CancellationToken::new();
+        // Attach at registration, exactly as the background spawn does.
+        task.cancel_token = Some(token.clone());
+        registry.register(task);
+
+        // Stand-in for run_query_loop: keep "working" until the shared token is
+        // signalled, mirroring the real loop's between-turn cancellation check.
+        let loop_token = token.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                if loop_token.is_cancelled() {
+                    return "cancelled";
+                }
+                tokio::select! {
+                    _ = loop_token.cancelled() => return "cancelled",
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        });
+
+        // Let the loop start spinning, then cancel via the registry.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        registry.cancel(&id);
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("loop must stop promptly after cancellation")
+            .expect("loop task must not panic");
+
+        assert_eq!(reason, "cancelled");
+        assert!(token.is_cancelled());
+        assert_eq!(
+            registry.get(&id).unwrap().status,
+            tasks::TaskStatus::Cancelled
+        );
     }
 }

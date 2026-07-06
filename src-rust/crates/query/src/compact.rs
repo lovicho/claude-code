@@ -486,6 +486,11 @@ pub fn format_compact_summary(raw: &str) -> String {
 
 /// Return the effective context-window size in tokens for the given model.
 /// These are approximate; the API enforces the real limits server-side.
+///
+/// This is a Claude-centric heuristic and only recognises Anthropic models —
+/// every other provider collapses to the ~100k default. Prefer
+/// [`resolve_context_window`], which consults the models.dev-backed registry
+/// first and only falls back to this heuristic.
 pub fn context_window_for_model(model: &str) -> u64 {
     if model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4") {
         200_000
@@ -496,14 +501,82 @@ pub fn context_window_for_model(model: &str) -> u64 {
     }
 }
 
+/// Smallest registry context-window value we treat as real.
+///
+/// When models.dev omits a limit, `ModelRegistry` stores a `4096` placeholder
+/// (see `model_registry.rs`). Compacting a live session at ~3.7k tokens would
+/// be absurd, so any registry value below this threshold is treated as
+/// "unknown" and we fall back to the model-name heuristic instead.
+const MIN_PLAUSIBLE_REGISTRY_WINDOW: u64 = 8192;
+
+/// Look up a plausible context-window value in the registry for a given
+/// `(provider, model_id)` pair. Returns `None` when there is no entry or the
+/// stored window is an implausible placeholder.
+fn registry_context_window(
+    registry: &claurst_api::ModelRegistry,
+    provider: &str,
+    model_id: &str,
+) -> Option<u64> {
+    let window = registry.get(provider, model_id)?.info.context_window as u64;
+    (window >= MIN_PLAUSIBLE_REGISTRY_WINDOW).then_some(window)
+}
+
+/// Resolve the effective context window for the active provider + model.
+///
+/// The models.dev-backed [`claurst_api::ModelRegistry`] is the source of truth:
+/// it carries real per-model context windows for *every* provider (Gemini/GPT
+/// 1M windows, 32k local models, …), so we prefer it. We fall back to the
+/// Claude-only [`context_window_for_model`] heuristic only when the registry is
+/// absent, has no matching entry, or only holds a placeholder value.
+///
+/// `model` may be either a bare model id (`"gemini-3-pro"`) or a canonical
+/// `"provider/model"` string; both forms are handled.
+pub fn resolve_context_window(
+    registry: Option<&claurst_api::ModelRegistry>,
+    provider: &str,
+    model: &str,
+) -> u64 {
+    if let Some(registry) = registry {
+        // The registry is keyed by bare model id, so strip a matching
+        // `"<provider>/"` prefix if the caller passed a canonical string.
+        let stripped = model
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(model);
+        if let Some(window) = registry_context_window(registry, provider, stripped) {
+            return window;
+        }
+        // Fall back to interpreting the model string itself as
+        // `"provider/model"` (e.g. when no explicit provider was supplied).
+        if let Some((embedded_provider, embedded_model)) = model.split_once('/') {
+            if let Some(window) =
+                registry_context_window(registry, embedded_provider, embedded_model)
+            {
+                return window;
+            }
+        }
+    }
+    context_window_for_model(model)
+}
+
 /// Determine token-warning state given current input token count and model.
+///
+/// Convenience wrapper that derives the window from the model-name heuristic.
+/// Prefer [`calculate_token_warning_state_for_window`] with a window resolved
+/// via [`resolve_context_window`] so non-Claude providers size correctly.
+pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWarningState {
+    calculate_token_warning_state_for_window(input_tokens, context_window_for_model(model))
+}
+
+/// Determine token-warning state against an explicit context window.
 ///
 /// Thresholds (mirrors TypeScript autoCompact.ts):
 ///   ≥ 95 % → Critical (red warning)
 ///   ≥ 80 % → Warning  (yellow warning)
 ///   <  80 % → Ok
-pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWarningState {
-    let window = context_window_for_model(model);
+pub fn calculate_token_warning_state_for_window(
+    input_tokens: u64,
+    window: u64,
+) -> TokenWarningState {
     let pct = input_tokens as f64 / window as f64;
 
     if pct >= CRITICAL_PCT {
@@ -516,11 +589,22 @@ pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWar
 }
 
 /// Return `true` when auto-compaction should fire.
+///
+/// Convenience wrapper that derives the window from the model-name heuristic.
+/// Prefer [`should_auto_compact_for_window`] with a resolved window.
 pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactState) -> bool {
+    should_auto_compact_for_window(input_tokens, context_window_for_model(model), state)
+}
+
+/// Return `true` when auto-compaction should fire, against an explicit window.
+pub fn should_auto_compact_for_window(
+    input_tokens: u64,
+    window: u64,
+    state: &AutoCompactState,
+) -> bool {
     if state.disabled {
         return false;
     }
-    let window = context_window_for_model(model);
     let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
     input_tokens >= threshold
 }
@@ -680,14 +764,19 @@ pub async fn compact_conversation(
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
 /// Returns `Some(new_messages)` if compaction ran, `None` otherwise.
+///
+/// `context_window` is the effective window for the active provider+model
+/// (resolve it via [`resolve_context_window`]); `model` is still used for the
+/// summarisation API call.
 pub async fn auto_compact_if_needed(
     client: &claurst_api::AnthropicClient,
     messages: &[Message],
     input_tokens: u64,
     model: &str,
+    context_window: u64,
     state: &mut AutoCompactState,
 ) -> Option<Vec<Message>> {
-    if !should_auto_compact(input_tokens, model, state) {
+    if !should_auto_compact_for_window(input_tokens, context_window, state) {
         return None;
     }
 
@@ -1395,6 +1484,91 @@ mod tests {
     #[test]
     fn test_context_window_legacy() {
         assert_eq!(context_window_for_model("claude-2"), 100_000);
+    }
+
+    // ---- resolve_context_window (#216) -------------------------------------
+
+    /// Build an in-memory `ModelRegistry` from a models.dev-style JSON snapshot
+    /// by round-tripping it through the real `load_cache` parse path.
+    fn registry_from_json(json: &str) -> claurst_api::ModelRegistry {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models_dev.json");
+        std::fs::write(&path, json).expect("write snapshot");
+        let mut reg = claurst_api::ModelRegistry::new();
+        reg.load_cache(&path);
+        reg
+    }
+
+    // A fake provider with a genuine 1M window and a placeholder (no-limit)
+    // model. Fake ids keep the fixture isolated from the bundled snapshot.
+    const TEST_SNAPSHOT: &str = r#"{"testprov":{"id":"testprov","name":"Test Provider","env":[],"models":{"big-context-model":{"id":"big-context-model","name":"Big Context Model","limit":{"context":1000000,"output":65536}},"tiny-model":{"id":"tiny-model","name":"Tiny Model"}}}}"#;
+
+    #[test]
+    fn resolve_prefers_registry_for_large_context_model() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Sanity: the registry really carries the 1M window.
+        assert_eq!(
+            reg.get("testprov", "big-context-model").unwrap().info.context_window,
+            1_000_000
+        );
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "big-context-model"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn resolve_handles_canonical_provider_slash_model_string() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Model string carries the provider prefix; still resolves to 1M.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "testprov/big-context-model"),
+            1_000_000
+        );
+        // Provider arg is wrong but the "provider/model" string still resolves.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "anthropic", "testprov/big-context-model"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_heuristic_when_registry_none() {
+        // No registry → heuristic. Claude-ish and legacy both come through.
+        assert_eq!(
+            resolve_context_window(None, "anthropic", "claude-opus-4-8"),
+            context_window_for_model("claude-opus-4-8")
+        );
+        assert_eq!(resolve_context_window(None, "anthropic", "claude-opus-4-8"), 200_000);
+        assert_eq!(resolve_context_window(None, "some-provider", "some-model"), 100_000);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_heuristic_when_no_registry_entry() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Provider/model that isn't in the registry → heuristic default.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "nope", "ghost-model"),
+            context_window_for_model("ghost-model")
+        );
+        assert_eq!(resolve_context_window(Some(&reg), "nope", "ghost-model"), 100_000);
+    }
+
+    #[test]
+    fn resolve_ignores_placeholder_4096_window() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // The registry stores the models.dev-omission placeholder (4096)...
+        assert_eq!(
+            reg.get("testprov", "tiny-model").unwrap().info.context_window,
+            4096
+        );
+        // ...but resolve treats it as "unknown" and uses the heuristic instead
+        // of compacting a real session at ~3.7k tokens.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "tiny-model"),
+            context_window_for_model("tiny-model")
+        );
+        assert_eq!(resolve_context_window(Some(&reg), "testprov", "tiny-model"), 100_000);
     }
 
     // ---- estimate_tokens_for_messages --------------------------------------

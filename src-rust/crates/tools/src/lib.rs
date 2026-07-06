@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
-pub mod bash;
 pub mod pty_bash;
 pub mod brief;
 pub mod config_tool;
@@ -26,6 +25,9 @@ pub mod exit_plan_mode;
 pub mod apply_patch;
 pub mod batch_edit;
 pub mod file_edit;
+pub mod line_endings;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod file_read;
 pub mod file_write;
 pub mod glob_tool;
@@ -57,7 +59,6 @@ pub mod goal_complete;
 // Re-exports for convenience.
 pub use formatter::try_format_file;
 pub use ask_user::AskUserQuestionTool;
-pub use bash::BashTool;
 pub use pty_bash::PtyBashTool;
 pub use brief::BriefTool;
 pub use config_tool::ConfigTool;
@@ -160,8 +161,9 @@ pub enum PermissionLevel {
     /// Potentially dangerous (e.g., bypass sandbox).
     Dangerous,
     /// Unconditionally forbidden — the action must never be executed regardless
-    /// of permission mode.  Used by BashTool when the classifier identifies a
-    /// `Critical`-risk command (e.g. `rm -rf /`, fork-bomb, `dd if=…`).
+    /// of permission mode.  Used by the bash tool (`PtyBashTool`) when the
+    /// classifier identifies a `Critical`-risk command (e.g. `rm -rf /`,
+    /// fork-bomb, `dd if=…`).
     Forbidden,
 }
 
@@ -181,8 +183,8 @@ pub struct PendingPermissionStore {
 
 /// Persistent shell state shared across Bash tool invocations within one session.
 ///
-/// The `BashTool` reads and writes this state on every call so that `cd` and
-/// `export` commands persist across separate tool invocations, matching the
+/// The bash tool (`PtyBashTool`) reads and writes this state on every call so
+/// that `cd` and `export` commands persist across separate tool invocations, matching the
 /// mental model described in the tool description ("the working directory
 /// persists between commands").
 #[derive(Debug, Clone, Default)]
@@ -301,6 +303,12 @@ pub struct ToolContext {
     /// Channel for the `AskUserQuestion` tool to send questions to the TUI and
     /// receive the user's typed answer.  `None` in headless / non-interactive mode.
     pub user_question_tx: Option<tokio::sync::mpsc::UnboundedSender<UserQuestionEvent>>,
+    /// Cancellation token for the owning query loop (issue #218). The parallel
+    /// tool executor selects on this to abandon in-flight tools when the user
+    /// cancels, and long-running tools may observe it to bail out early. Defaults
+    /// to a fresh disconnected token; `run_query_loop` rebinds it to the loop's
+    /// actual token so cancellation propagates into tools and sub-agents.
+    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl ToolContext {
@@ -505,6 +513,19 @@ pub trait Tool: Send + Sync {
     /// The permission level the tool requires.
     fn permission_level(&self) -> PermissionLevel;
 
+    /// Whether this tool performs its own permission gating inside `execute()`.
+    ///
+    /// - `false` (default): the central backstop in `execute_tool` is
+    ///   responsible for gating this tool. Secure by default — a tool that
+    ///   forgets to call `ctx.check_permission*` is still caught by the backstop
+    ///   whenever its `permission_level()` is a gated level.
+    /// - `true`: the tool already prompts for permission internally (it calls
+    ///   `ctx.check_permission*` in `execute()`), so the central gate must NOT
+    ///   also prompt — this prevents double-prompting.
+    fn self_gates(&self) -> bool {
+        false
+    }
+
     /// JSON Schema describing the tool's input parameters.
     fn input_schema(&self) -> Value;
 
@@ -632,6 +653,7 @@ mod tests {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -848,5 +870,60 @@ mod tests {
         assert_eq!(def.name, "Bash");
         assert!(!def.description.is_empty());
         assert!(def.input_schema.is_object());
+    }
+
+    // ---- write_atomic tests -------------------------------------------------
+    //
+    // `write_atomic` is the single atomic-write path that ApplyPatch, BatchEdit,
+    // NotebookEdit and the cron store (#226) all route through. These tests pin
+    // its contract: it writes the exact bytes and never leaves a temp file
+    // behind on success — the guarantee that makes those tools crash-safe.
+
+    /// Count the `.claurst-tmp-*` scratch files left in `dir`.
+    fn count_atomic_tmp_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".claurst-tmp-")
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn write_atomic_writes_content_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+
+        // Fresh file.
+        write_atomic(&path, b"hello\nworld\n").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nworld\n");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0, "no tmp after create");
+
+        // Overwrite an existing file (the crash-truncation scenario #226 fixes).
+        write_atomic(&path, b"replaced").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0, "no tmp after overwrite");
+    }
+
+    /// The executable bit (and other permissions) must survive an atomic
+    /// overwrite, since we rename a fresh temp file over the destination.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.sh");
+
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_atomic(&path, b"#!/bin/sh\necho hi\n").await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "executable bit preserved");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0);
     }
 }

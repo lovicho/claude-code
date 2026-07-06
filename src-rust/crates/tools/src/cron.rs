@@ -260,6 +260,9 @@ fn default_true() -> bool { true }
 
 #[async_trait]
 impl Tool for CronCreateTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "CronCreate" }
 
     fn description(&self) -> &str {
@@ -272,7 +275,10 @@ impl Tool for CronCreateTool {
          Use durable=true to persist across sessions."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    // Creating a scheduled task installs a durable/session prompt that later runs
+    // an agent unattended, so it is an arbitrary-execution primitive and must be
+    // gated (issue #209) — not `None`.
+    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Execute }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -299,7 +305,7 @@ impl Tool for CronCreateTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: CronCreateInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -310,6 +316,22 @@ impl Tool for CronCreateTool {
                 "Invalid cron expression '{}'. Expected 5 fields: M H DoM Mon DoW.",
                 params.cron
             ));
+        }
+
+        // ── Security gate (issue #209) ───────────────────────────────────────
+        // Installing a scheduled task persists a prompt that will later run an
+        // agent unattended (and, when durable, across sessions). Gate it BEFORE
+        // persisting so the user sees exactly what durable task is being
+        // installed. `is_read_only = false` treats it as arbitrary execution.
+        let prompt_preview: String = params.prompt.chars().take(120).collect();
+        let reason = format!(
+            "Install {} scheduled task ({}) that will run prompt: {}",
+            if params.durable { "durable" } else { "session" },
+            cron_to_human(&params.cron),
+            prompt_preview
+        );
+        if let Err(e) = ctx.check_permission(self.name(), &reason, false) {
+            return ToolResult::error(e.to_string());
         }
 
         // Ensure persistent tasks are loaded from disk before we check the count.
@@ -504,7 +526,85 @@ async fn persist_tasks_to_disk(store: &HashMap<String, CronTask>) -> Result<(), 
         .await
         .map_err(|e| e.to_string())?;
 
-    tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
+    crate::write_atomic(&path, json.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Handler that always asks; with `non_interactive = true` this denies.
+    struct DenyHandler;
+    impl claurst_core::permissions::PermissionHandler for DenyHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Ask {
+                reason: "denied in test".to_string(),
+            }
+        }
+        fn request_permission(
+            &self,
+            request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    fn deny_ctx() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(DenyHandler),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "cron-deny-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn cron_create_requires_execute_permission_level() {
+        assert_eq!(CronCreateTool.permission_level(), PermissionLevel::Execute);
+    }
+
+    #[tokio::test]
+    async fn cron_create_denied_permission_does_not_persist() {
+        // Unique marker so we can assert the task never made it into the store.
+        let marker = "CRON_209_UNIQUE_MARKER_do_not_run";
+        let ctx = deny_ctx();
+        let result = CronCreateTool
+            .execute(
+                json!({ "cron": "*/5 * * * *", "prompt": marker, "durable": true }),
+                &ctx,
+            )
+            .await;
+
+        assert!(result.is_error, "denied CronCreate must return an error");
+
+        // The gate runs before any store mutation, so no task with our marker
+        // should exist in the global store.
+        let store = CRON_STORE.read().await;
+        assert!(
+            !store.values().any(|t| t.prompt == marker),
+            "denied CronCreate must not persist the task"
+        );
+    }
 }

@@ -289,7 +289,7 @@ fn normalize_at_tokens(
         if trimmed.starts_with('@') && trimmed.len() > 1 {
             let mut path_part = trimmed[1..].to_string();
             // Strip trailing punctuation (same logic as parse_at_refs)
-            while path_part.len() > 0 && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
+            while !path_part.is_empty() && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
                 path_part.pop();
             }
             let punct_suffix = &trimmed[1 + path_part.len()..];
@@ -1194,7 +1194,7 @@ pub fn render_tool_result_rejected(tool_name: &str, reason: &str) -> Vec<Line<'s
 pub fn render_attachment_message(kind_label: &str, content: &str, width: u16) -> Vec<Line<'static>> {
     // Reserve space for the "  [label] " prefix and a small margin.
     let prefix_len = kind_label.len() + 6; // "  [label] "
-    let preview_max = (width as usize).saturating_sub(prefix_len).max(20).min(120);
+    let preview_max = (width as usize).saturating_sub(prefix_len).clamp(20, 120);
     let preview: String = content.chars().take(preview_max).collect();
     let preview = if content.chars().count() > preview_max {
         format!("{preview}\u{2026}")
@@ -1817,9 +1817,7 @@ fn extract_goal_objective_from_args(args: &str) -> Option<String> {
     // doesn't include the budget flag.
     let rest = if let Some(after_flag) = trimmed.strip_prefix("--tokens") {
         let after_flag = after_flag.trim_start();
-        after_flag
-            .splitn(2, char::is_whitespace)
-            .nth(1)
+        after_flag.split_once(char::is_whitespace).map(|x| x.1)
             .unwrap_or("")
             .trim()
     } else {

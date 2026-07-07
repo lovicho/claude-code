@@ -11,28 +11,42 @@ use tracing::debug;
 // Session-aware persistence helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the path to the persisted todo list for `session_id`.
-pub fn todos_path(session_id: &str) -> PathBuf {
-    todos_dir().join(format!("{}.json", session_id))
+/// Validate that `session_id` is a plain filename — no path separators or
+/// `..` components that could be used for directory traversal (issue #204).
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+        return Err("session_id contains illegal characters".into());
+    }
+    Ok(())
 }
 
-/// Directory holding persisted todo lists (`~/.claurst/todos`).
+/// Returns the path to the persisted todo list for `session_id`.
+pub fn todos_path(session_id: &str) -> anyhow::Result<PathBuf> {
+    validate_session_id(session_id).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(todos_dir().join(format!("{}.json", session_id)))
+}
+
+/// Directory holding persisted todo lists (`<claurst home>/todos`).
 fn todos_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claurst")
-        .join("todos")
+    claurst_core::config::Settings::config_dir().join("todos")
 }
 
 /// Load the persisted todo list for `session_id`. Returns an empty vec if the
-/// file does not exist or cannot be parsed.
+/// file does not exist, cannot be parsed, or if `session_id` contains illegal
+/// path characters (issue #204).
 pub fn load_todos(session_id: &str) -> Vec<Value> {
     load_todos_in(&todos_dir(), session_id)
 }
 
 /// Like [`load_todos`] but reads from an explicit todos directory. Lets tests
 /// run hermetically without depending on a writable HOME.
+///
+/// Returns an empty vec when `session_id` contains illegal path characters
+/// (issue #204).
 pub fn load_todos_in(dir: &Path, session_id: &str) -> Vec<Value> {
+    if validate_session_id(session_id).is_err() {
+        return vec![];
+    }
     let path = dir.join(format!("{}.json", session_id));
     std::fs::read_to_string(&path)
         .ok()
@@ -47,7 +61,13 @@ pub fn save_todos(session_id: &str, todos: &[Value]) {
 
 /// Like [`save_todos`] but writes into an explicit todos directory. Lets tests
 /// run hermetically without depending on a writable HOME.
+///
+/// Silently returns when `session_id` contains illegal path characters
+/// (issue #204).
 pub fn save_todos_in(dir: &Path, session_id: &str, todos: &[Value]) {
+    if validate_session_id(session_id).is_err() {
+        return;
+    }
     let path = dir.join(format!("{}.json", session_id));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -359,15 +379,19 @@ mod tests {
 
     #[test]
     fn test_todos_path_contains_session_id() {
-        let path = todos_path("my-session-123");
+        let path = todos_path("my-session-123").unwrap();
         let path_str = path.to_string_lossy();
         assert!(
             path_str.contains("my-session-123"),
             "todos_path should embed the session id"
         );
+        // Route the assertion through the same canonical resolver instead of
+        // hardcoding `.claurst`: the todos file must live under the resolved
+        // claurst home (which may be ~/.claurst, $CLAURST_HOME, or the XDG dir).
+        let home = claurst_core::config::Settings::config_dir();
         assert!(
-            path_str.contains(".claurst"),
-            "todos_path should be under ~/.claurst"
+            path.starts_with(home.join("todos")),
+            "todos_path should be under the claurst home"
         );
         assert!(
             path_str.ends_with(".json"),

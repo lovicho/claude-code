@@ -183,6 +183,63 @@ fn render_error_modal(frame: &mut Frame, area: Rect, notification: &Notification
 // Text truncation helpers
 // -----------------------------------------------------------------------
 
+/// Short relative timestamp for the welcome screen's recent-activity list:
+/// "just now", "5m ago", "2h ago", "3d ago". Clock skew (mtime in the future)
+/// degrades gracefully to "just now".
+fn short_relative_time(mtime: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(mtime)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    short_relative_secs(secs)
+}
+
+/// Formatter split out from [`short_relative_time`] so it can be unit-tested
+/// without depending on the wall clock.
+fn short_relative_secs(secs: u64) -> String {
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Build the body lines for the welcome box's "Recent activity" section.
+///
+/// Renders up to five recent sessions as `<label> <relative-time>` (the label
+/// truncated to fit `width`), or a single dimmed "No recent activity" line when
+/// there are none. Split out from [`render_welcome_box`] so it can be unit
+/// tested from controlled state without the surrounding layout.
+fn recent_activity_lines(recent: &[crate::app::RecentSession], width: usize) -> Vec<Line<'static>> {
+    if recent.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No recent activity",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+
+    recent
+        .iter()
+        .take(5)
+        .map(|s| {
+            let when = short_relative_time(s.mtime);
+            // Reserve room for the trailing " <time>" so the label truncates
+            // instead of wrapping onto a second line.
+            let label_w = width.saturating_sub(when.chars().count() + 1);
+            let label = truncate_end(&s.label, label_w.max(1));
+            Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::Gray)),
+                Span::raw(" "),
+                Span::styled(when, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect()
+}
+
 fn truncate_end(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -508,7 +565,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             // instead of overflowing the input area.  Cap at 3 lines.
             let usable_width = size.width.max(1) as usize;
             let char_count = text.chars().count();
-            ((char_count + usable_width - 1) / usable_width).max(1).min(3) as u16
+            char_count.div_ceil(usable_width).clamp(1, 3) as u16
         } else {
             1
         }
@@ -524,7 +581,14 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // ("> ") and the right-margin padding used inside `render_prompt_input`.
     // Keep this in sync with prefix_width=2 + right_pad=2 there.
     let prompt_text_width = size.width.saturating_sub(4);
-    let prompt_height = input_height(&app.prompt_input, prompt_text_width) + 1; // +1 for model/mode status line
+    // While the `/effort` selector is open it DOCKS into the prompt area, fully
+    // replacing the prompt box, so the row budget follows the docked panel height
+    // (clamped by the layout below) instead of the prompt's own line count.
+    let prompt_height = if app.effort_picker.visible {
+        crate::effort_picker::DOCK_HEIGHT
+    } else {
+        input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -543,7 +607,19 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if status_height > 0 {
         render_status_row(frame, app, chunks[2]);
     }
-    render_input(frame, app, chunks[3], prompt_focused);
+    // The `/effort` selector replaces the prompt box while open: render it into
+    // the input area (full width) and SKIP the prompt input. The prompt returns
+    // when the picker closes on confirm/cancel.
+    if app.effort_picker.visible {
+        crate::effort_picker::render_effort_picker(
+            frame,
+            &app.effort_picker,
+            chunks[3],
+            app.frame_count,
+        );
+    } else {
+        render_input(frame, app, chunks[3], prompt_focused);
+    }
     app.last_input_area.set(chunks[3]);
     if suggestions_height > 0 {
         render_prompt_suggestions(frame, app, chunks[4]);
@@ -700,10 +776,8 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_onboarding_dialog(frame, &app.onboarding_dialog, size);
     }
 
-    // /effort picker
-    if app.effort_picker.visible {
-        crate::effort_picker::render_effort_picker(frame, &app.effort_picker, size);
-    }
+    // The `/effort` selector is NOT an overlay — it docks into the prompt input
+    // area (see the input dispatch above), replacing the prompt box while open.
 
     // Import-config source picker
     if app.import_config_picker.visible {
@@ -1617,7 +1691,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
 
     // Split inner into left | divider(1) | right
     // Left width: ~28 chars or half the inner width, whichever is smaller
-    let left_w = (inner.width / 2).max(22).min(32).min(inner.width.saturating_sub(3));
+    let left_w = (inner.width / 2).clamp(22, 32).min(inner.width.saturating_sub(3));
     let right_w = inner.width.saturating_sub(left_w + 1);
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1684,10 +1758,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         "Recent activity",
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )));
-    right_lines.push(Line::from(Span::styled(
-        "No recent activity",
-        Style::default().fg(Color::DarkGray),
-    )));
+    right_lines.extend(recent_activity_lines(&app.recent_sessions, right_w_usize));
 
     frame.render_widget(Paragraph::new(right_lines).wrap(Wrap { trim: false }), h_chunks[2]);
 }
@@ -2154,7 +2225,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
                     && !t.eq_ignore_ascii_case(STATUS_THINKING)
                     && !t.eq_ignore_ascii_case(STATUS_THINKING_ELLIPSIS)
             })
-            .or_else(|| app.spinner_verb.as_deref())
+            .or(app.spinner_verb.as_deref())
             .unwrap_or("Thinking");
 
         let mut s = vec![Span::styled(
@@ -3539,5 +3610,185 @@ mod stream_cache_tests {
         let text = joined_text(&completed);
         assert!(text.contains("a1 committed"));
         assert!(text.contains("live answer body"));
+    }
+}
+
+/// The `/effort` selector docks into the prompt area and replaces the prompt box
+/// while open (issue #275).
+#[cfg(test)]
+mod effort_dock_tests {
+    use super::*;
+    use crate::app::App;
+    use crate::model_picker::EffortLevel;
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// The prompt pointer glyph drawn by `render_prompt_input`.
+    const PROMPT_POINTER: char = '\u{276f}';
+
+    fn render_screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn effort_picker_replaces_prompt_box_when_open() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+
+        // Closed: the prompt box (its pointer) is drawn; no selector chrome.
+        let closed = render_screen(&app);
+        assert!(
+            closed.contains(PROMPT_POINTER),
+            "prompt pointer should be visible when the picker is closed"
+        );
+        assert!(
+            !closed.contains("ultracode"),
+            "selector labels must not show while the picker is closed"
+        );
+
+        // Open: the selector takes over the prompt area; the prompt box is gone.
+        app.effort_picker.open(
+            EffortLevel::High,
+            vec![
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+                EffortLevel::XHigh,
+                EffortLevel::Max,
+                EffortLevel::Ultracode,
+            ],
+        );
+        let open = render_screen(&app);
+        assert!(
+            open.contains("Effort") && open.contains("ultracode"),
+            "the docked Effort selector should render in the prompt area"
+        );
+        assert!(
+            !open.contains(PROMPT_POINTER),
+            "prompt input must NOT be drawn while the picker is open"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Welcome screen: recent activity (issue #277)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recent_activity_tests {
+    use super::*;
+    use crate::app::{App, RecentSession};
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::time::{Duration, SystemTime};
+
+    fn recent(label: &str, secs_ago: u64) -> RecentSession {
+        RecentSession {
+            label: label.to_string(),
+            mtime: SystemTime::now() - Duration::from_secs(secs_ago),
+        }
+    }
+
+    fn lines_text(recent: &[RecentSession], width: usize) -> Vec<String> {
+        recent_activity_lines(recent, width)
+            .iter()
+            .map(flatten_line_text)
+            .collect()
+    }
+
+    // -- relative-time formatter ------------------------------------------
+
+    #[test]
+    fn short_relative_secs_buckets() {
+        assert_eq!(short_relative_secs(0), "just now");
+        assert_eq!(short_relative_secs(59), "just now");
+        assert_eq!(short_relative_secs(60), "1m ago");
+        assert_eq!(short_relative_secs(5 * 60), "5m ago");
+        assert_eq!(short_relative_secs(2 * 3_600), "2h ago");
+        assert_eq!(short_relative_secs(3 * 86_400), "3d ago");
+    }
+
+    #[test]
+    fn short_relative_time_handles_future_mtime() {
+        // Clock skew (mtime slightly in the future) must not panic.
+        let future = SystemTime::now() + Duration::from_secs(120);
+        assert_eq!(short_relative_time(future), "just now");
+    }
+
+    // -- render-from-state path -------------------------------------------
+
+    #[test]
+    fn empty_state_shows_placeholder() {
+        let out = lines_text(&[], 40);
+        assert_eq!(out, vec!["No recent activity".to_string()]);
+    }
+
+    #[test]
+    fn populated_state_shows_titles_and_relative_times() {
+        let sessions = vec![
+            recent("Fix the parser bug", 2 * 3_600),
+            recent("Wire up onboarding", 3 * 86_400),
+        ];
+        let out = lines_text(&sessions, 40).join("\n");
+        assert!(out.contains("Fix the parser bug"), "first title: {out:?}");
+        assert!(out.contains("2h ago"), "first time: {out:?}");
+        assert!(out.contains("Wire up onboarding"), "second title: {out:?}");
+        assert!(out.contains("3d ago"), "second time: {out:?}");
+        // The placeholder must NOT appear when there is real activity.
+        assert!(!out.contains("No recent activity"), "no placeholder: {out:?}");
+    }
+
+    #[test]
+    fn caps_at_five_entries() {
+        let sessions: Vec<RecentSession> =
+            (0..8).map(|i| recent(&format!("session {i}"), 60)).collect();
+        assert_eq!(recent_activity_lines(&sessions, 40).len(), 5);
+    }
+
+    #[test]
+    fn long_label_is_truncated_and_leaves_room_for_time() {
+        let sessions = vec![recent(
+            "an extremely long session title that should be truncated to fit",
+            60,
+        )];
+        let out = lines_text(&sessions, 20);
+        assert_eq!(out.len(), 1);
+        let line = &out[0];
+        assert!(line.contains('\u{2026}'), "should be ellipsised: {line:?}");
+        assert!(line.ends_with("1m ago"), "time preserved at end: {line:?}");
+    }
+
+    #[test]
+    fn welcome_box_renders_recent_activity_from_state() {
+        // Full-widget smoke test: the section header renders and, when state is
+        // populated, a session label reaches the screen buffer without panic.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.recent_sessions = vec![recent("Sortable label ABCDEF", 2 * 3_600)];
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_welcome_box(frame, &app, frame.area()))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(screen.contains("Recent activity"), "header rendered: present");
+        assert!(screen.contains("Sortable label"), "session label rendered");
     }
 }

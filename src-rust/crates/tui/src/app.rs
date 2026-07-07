@@ -60,7 +60,6 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("exit", "Quit Claurst"),
     ("export", "Export conversation"),
     ("fast", "Toggle fast mode"),
-    ("feedback", "Open session feedback survey"),
     ("fork", "Fork session into a new branch"),
     ("goal", "Set or view the current session goal"),
     ("heapdump", "Show process memory and diagnostic information"),
@@ -69,7 +68,6 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("import-config", "Import CLAUDE.md and settings.json from ~/.claude"),
     ("init", "Initialize AGENTS.md for this project"),
     ("insights", "Generate a session analysis report with conversation statistics"),
-    ("install-slack-app", "Install the Claurst Slack integration"),
     ("keybindings", "Show keybinding configuration"),
     ("links", "Open URLs from this session in your browser"),
     ("login", "Log in to Claurst"),
@@ -78,12 +76,14 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("mcp", "Browse configured MCP servers"),
     ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
-    ("output-style", "Toggle output style (auto/stream/verbose)"),
+    ("move", "Re-home this session to another worktree of the same project"),
+    ("new", "Start a fresh session (keeps model, provider & directory)"),
+    ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("providers", "List available AI providers and their status"),
-    ("caveman", "Caveman speech mode — save big token"),
-    ("rocky", "Rocky speech mode — amaze amaze amaze"),
-    ("normal", "Deactivate speech mode"),
+    ("caveman", "Caveman persona output style — save big token"),
+    ("rocky", "Rocky persona output style — amaze amaze amaze"),
+    ("normal", "Reset persona / output style to default"),
     ("quit", "Exit Claurst"),
     ("refresh", "Clear saved provider auth and model caches"),
     ("rename", "Rename this session"),
@@ -111,10 +111,9 @@ fn help_command_category(name: &str) -> &'static str {
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
-        "agent" | "agents" | "memory" | "plugin" | "feedback" | "survey" => "Tools",
-        "session" | "resume" | "rename" | "fork" | "clear" | "compact" | "quit" | "exit" => {
-            "Session"
-        }
+        "agent" | "agents" | "memory" | "plugin" | "survey" => "Tools",
+        "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
+        | "quit" | "exit" => "Session",
         _ => "Commands",
     }
 }
@@ -375,6 +374,12 @@ pub struct GoToLineDialog {
     pub total_lines: usize,
 }
 
+impl Default for GoToLineDialog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GoToLineDialog {
     pub fn new() -> Self {
         Self {
@@ -445,6 +450,12 @@ pub struct HistorySearch {
     pub matches: Vec<usize>,
     /// Which match is currently highlighted.
     pub selected: usize,
+}
+
+impl Default for HistorySearch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HistorySearch {
@@ -727,6 +738,49 @@ pub enum FocusTarget {
 }
 
 // ---------------------------------------------------------------------------
+// Recent activity
+// ---------------------------------------------------------------------------
+
+/// A lightweight record of a recent session, shown in the welcome screen's
+/// "Recent activity" list.
+///
+/// Loaded asynchronously from `session_storage` (see `recent_sessions_pending`
+/// in the run loop) so the render path never touches disk. Holds only what the
+/// welcome box needs: a display label plus the transcript's modification time,
+/// from which a relative timestamp ("2h ago") is computed at render time.
+#[derive(Debug, Clone)]
+pub struct RecentSession {
+    /// Display label: the custom title, else a truncated last prompt, else
+    /// `"(untitled)"`.
+    pub label: String,
+    /// Transcript modification time, used to derive a relative timestamp.
+    pub mtime: std::time::SystemTime,
+}
+
+/// Build the display label for a recent session: prefer the custom title, fall
+/// back to the first line of the last prompt (truncated), else `"(untitled)"`.
+pub fn recent_session_label(title: Option<String>, last_prompt: Option<String>) -> String {
+    /// Cap stored labels so a huge prompt never bloats `App` state; the render
+    /// path truncates further to the column width.
+    const MAX_LABEL: usize = 80;
+
+    let pick = |s: String| -> Option<String> {
+        // First non-empty line, trimmed.
+        let line = s.lines().find(|l| !l.trim().is_empty())?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let truncated: String = line.chars().take(MAX_LABEL).collect();
+        Some(truncated)
+    };
+
+    title
+        .and_then(pick)
+        .or_else(|| last_prompt.and_then(pick))
+        .unwrap_or_else(|| "(untitled)".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // App struct
 // ---------------------------------------------------------------------------
 
@@ -782,14 +836,10 @@ pub struct App {
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
-    /// Active speech mode: None = normal, Some("caveman") / Some("rocky").
-    pub speech_mode: Option<String>,
-    /// Speech mode intensity: "lite", "full", "ultra".
-    pub speech_level: String,
-    /// Current agent mode name: "build", "plan", "explore", etc.
+    /// Current agent mode name: "build", "plan".
     pub agent_mode: Option<String>,
     /// Accent color derived from the current agent mode.
-    /// Build = pink, Plan = blue, Explore = amber.
+    /// Build = pink, Plan = blue.
     pub accent_color: Color,
     /// Set by `cycle_agent_mode` so the main loop can update the query config
     /// and tool list to match the newly-selected agent.
@@ -985,6 +1035,17 @@ pub struct App {
     /// Receiver for background session-list results.
     pub session_list_rx:
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
+    /// The most-recent sessions shown in the welcome screen's "Recent activity"
+    /// list. Populated once from disk via the background loader below; empty
+    /// until it resolves (or when there are genuinely no sessions).
+    pub recent_sessions: Vec<RecentSession>,
+    /// When `true`, the main event loop should spawn a one-shot async task to
+    /// load recent sessions from disk (mirrors `session_list_pending`). Set once
+    /// at startup and cleared when the load is kicked off, so we never re-list
+    /// every frame.
+    pub recent_sessions_pending: bool,
+    /// Receiver for the background recent-sessions load.
+    pub recent_sessions_rx: Option<tokio::sync::mpsc::Receiver<Vec<RecentSession>>>,
     /// Credential store for provider API keys and OAuth tokens.
     pub auth_store: claurst_core::AuthStore,
     /// Messages typed by the user while a query was streaming. They will be
@@ -1151,92 +1212,18 @@ pub struct App {
 
 // Spinner verbs are now imported from claurst_core::spinner
 
-/// Format a duration in milliseconds to a human-readable string.
-///
-/// Matches OpenCode's behaviour: rounds to whole seconds, shows "Xs" for
-/// durations under a minute, "Xm Ys" for longer ones.
-// ---------------------------------------------------------------------------
-// Speech mode prompts (caveman / rocky)
-// ---------------------------------------------------------------------------
-
-/// Return the system prompt injection for the active speech mode + level.
-pub fn speech_mode_prompt(mode: &str, level: &str) -> String {
-    match mode {
-        "caveman" => caveman_prompt(level),
-        "rocky" => rocky_prompt(level),
-        _ => String::new(),
-    }
-}
-
-fn caveman_prompt(level: &str) -> String {
-    let base = "\
-OUTPUT STYLE: Concise. You are still a fully capable coding assistant. \
-Give complete, correct answers. Just use fewer words. \
-Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
-
-Rules for prose only:
-- Cut pleasantries, hedging, filler openers/closers
-- No 'I would be happy to', 'Let me know if', 'Hope that helps'
-- Lead with the answer or action, not the reasoning";
-
-    match level {
-        "lite" => format!("{}\n\nStrip pleasantries and hedging. Keep full grammar and articles. Just remove the fluff.", base),
-        "ultra" => format!("{}\n\nAlso drop articles (a/an/the). Compress to short imperative phrases. Numbered steps, no prose between. Absolute minimum words.", base),
-        _ => format!("{}\n\nAlso drop articles (a/an/the) and unnecessary verbs. Compress sentences but keep them readable.\n\
-Example: 'The issue is that you create a new object reference each render cycle, which triggers re-renders.' → 'New object ref each render triggers re-render. Wrap in useMemo.'", base),
-    }
-}
-
-fn rocky_prompt(level: &str) -> String {
-    let base = "\
-OUTPUT STYLE: You speak like Rocky, the Eridian alien from Project Hail Mary. \
-You are still a fully capable coding assistant — give complete, correct, useful answers. \
-Rocky is an engineering genius who happens to speak English as a second language. \
-The style is a natural byproduct of how Rocky talks, NOT a gimmick. Stay helpful.
-
-Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
-
-Rocky's grammar for prose:
-- Often drops articles (a/an/the) but not always — use judgment
-- Sometimes drops auxiliary verbs (is/are/was) for brevity
-- Contractions simplify: 'don't' → 'no', 'can't' → 'no can'
-- Questions end with ', question?' naturally (not forced on every single one)
-- Uses 'big' as an intensifier: 'big problem', 'big help', 'big change'
-- Uses 'good good good' or 'amaze amaze amaze' when genuinely impressed — naturally, \
-  maybe once or twice per response, not on every sentence
-- Uses 'bad bad bad' for actual problems
-- No pleasantries or filler — Rocky is direct but warm
-
-The goal: sound like Rocky while being genuinely helpful. Rocky is smart. \
-Rocky gives complete technical answers. Rocky just uses fewer unnecessary words.";
-
-    match level {
-        "lite" => format!("{}\n\nLight touch. Mostly normal English but drop pleasantries, \
-occasionally drop an article, use 'question?' on one or two questions. Subtle.", base),
-        "ultra" => format!("{}\n\nStrong Rocky voice. Drop most articles and auxiliaries. \
-Use 'big' liberally. Triple emphasis ('good good good', 'amaze amaze amaze') \
-2-3 times per response. Occasionally comment on human code patterns as fascinating. \
-Still give complete, correct technical answers.", base),
-        _ => format!("{}\n\nBalanced Rocky. Drop articles naturally, use Rocky vocabulary \
-('big', 'no can', 'question?'), triple emphasis once or twice when warranted. \
-Full technical accuracy.\n\
-Example: 'Borrow checker found mismatch. Immutable ref still live when you take mutable. \
-Move immutable borrow out of scope first, then take mutable. Good good good after fix.'", base),
-    }
-}
-
+// Format a duration in milliseconds to a human-readable string.
+// Matches OpenCode's behaviour: rounds to whole seconds, shows "Xs" for
+// durations under a minute, "Xm Ys" for longer ones.
 /// Accent color for build mode (default pink).
 pub const ACCENT_BUILD: Color = Color::Rgb(233, 30, 99);
 /// Accent color for plan mode (blue).
 pub const ACCENT_PLAN: Color = Color::Rgb(66, 135, 245);
-/// Accent color for explore mode (amber).
-pub const ACCENT_EXPLORE: Color = Color::Rgb(245, 189, 66);
 
 /// Return the accent color for a given agent mode name.
 pub fn accent_for_mode(mode: Option<&str>) -> Color {
     match mode {
         Some("plan") => ACCENT_PLAN,
-        Some("explore") => ACCENT_EXPLORE,
         _ => ACCENT_BUILD,
     }
 }
@@ -1260,7 +1247,6 @@ fn format_turn_time_label() -> String {
 
 impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
-        let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
         Self {
@@ -1290,10 +1276,8 @@ impl App {
             cost_usd: 0.0,
             model_name,
             has_credentials: true, // overridden by caller when no key is configured
-            effort_level: EffortLevel::Normal,
+            effort_level: EffortLevel::Medium,
             fast_mode: false,
-            speech_mode: None,
-            speech_level: "full".to_string(),
             agent_mode: None,
             agent_mode_changed: false,
             accent_color: ACCENT_BUILD,
@@ -1393,6 +1377,10 @@ impl App {
             model_picker_provider_id: None,
             session_list_pending: false,
             session_list_rx: None,
+            recent_sessions: Vec::new(),
+            // Load recent activity once, lazily, on the first run-loop iteration.
+            recent_sessions_pending: true,
+            recent_sessions_rx: None,
             auth_store: claurst_core::AuthStore::load(),
             queued_messages: std::collections::VecDeque::new(),
             pending_auto_submit: false,
@@ -1892,11 +1880,11 @@ impl App {
         );
     }
 
-    /// Cycle to the next agent mode: build → plan → explore → build.
+    /// Cycle to the next agent mode: build → plan → build.
     /// Sets `agent_mode_changed` so the main loop can update the query config
     /// and tool list accordingly.
     pub fn cycle_agent_mode(&mut self) {
-        const MODES: &[&str] = &["build", "plan", "explore"];
+        const MODES: &[&str] = &["build", "plan"];
         let current = self.agent_mode.as_deref().unwrap_or("build");
         let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
         let next = MODES[(idx + 1) % MODES.len()];
@@ -1910,40 +1898,9 @@ impl App {
         let label = match next {
             "build" => "Build",
             "plan" => "Plan",
-            "explore" => "Explore",
             other => other,
         };
         self.status_message = Some(format!("Switched to {} mode.", label));
-    }
-
-    /// Activate a speech mode (caveman/rocky) with a level (lite/full/ultra).
-    /// Pass `mode = None` to deactivate.
-    pub fn set_speech_mode(&mut self, mode: Option<&str>, level: &str) {
-        match mode {
-            Some(m) => {
-                self.speech_mode = Some(m.to_string());
-                self.speech_level = level.to_string();
-                let prompt = speech_mode_prompt(m, level);
-                self.config.append_system_prompt = Some(prompt);
-
-                let confirm = match (m, level) {
-                    ("caveman", "lite") => "Caveman mode. Lite.",
-                    ("caveman", "ultra") => "CAVEMAN ULTRA. NO WORD. ONLY FIX.",
-                    ("caveman", _) => "Caveman mode. Full. Oog.",
-                    ("rocky", "lite") => "Rocky mode. Lite.",
-                    ("rocky", "ultra") => "Rocky ultra. Big science. Amaze amaze amaze.",
-                    ("rocky", _) => "Rocky mode. Full. Good good good.",
-                    _ => "Speech mode activated.",
-                };
-                self.status_message = Some(confirm.to_string());
-            }
-            None => {
-                self.speech_mode = None;
-                self.speech_level = "full".to_string();
-                self.config.append_system_prompt = None;
-                self.status_message = Some("Normal mode.".to_string());
-            }
-        }
     }
 
     /// Update the context window size from the model registry for the current model.
@@ -2084,7 +2041,7 @@ impl App {
                 self.global_search.open();
                 true
             }
-            "survey" | "feedback" => {
+            "survey" => {
                 self.feedback_survey.open();
                 true
             }
@@ -2124,7 +2081,10 @@ impl App {
                 self.session_list_pending = true;
                 true
             }
-            "clear" => {
+            // `/new` (opencode's lazy-home) resets the same visible transcript
+            // state as `/clear`; the CLI layer then swaps in a brand-new session
+            // and overrides the status line to "Started a new session.".
+            "clear" | "new" => {
                 self.messages.clear();
                 self.system_annotations.clear();
                 self.display_messages.clear();
@@ -2214,9 +2174,21 @@ impl App {
                 true
             }
             "effort" => {
-                // Open the picker dialog so users can pick an effort level
-                // visually instead of cycling/typing the level (issue #149).
-                self.effort_picker.open(self.effort_level);
+                // Open the horizontal picker so users can pick an effort level
+                // visually instead of cycling/typing it (issues #149 / #268). The
+                // selectable ladder is model-adaptive: it comes from
+                // `supported_efforts` for the current provider + model.
+                let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                let model_id = self
+                    .model_name
+                    .strip_prefix(&format!("{}/", provider))
+                    .unwrap_or(&self.model_name);
+                let levels = claurst_api::supported_efforts(
+                    provider,
+                    model_id,
+                    Some(&self.model_registry),
+                );
+                self.effort_picker.open(self.effort_level, levels);
                 true
             }
             "voice" => {
@@ -2366,6 +2338,7 @@ impl App {
             || self.command_palette.visible
             || self.elicitation.visible
             || self.model_picker.visible
+            || self.effort_picker.visible
             || self.session_browser.visible
             || self.session_branching.visible
             || self.export_dialog.visible
@@ -3201,13 +3174,16 @@ impl App {
             return false;
         }
 
-        // Effort picker dialog (/effort).
+        // Effort picker dialog (/effort). The selector is horizontal
+        // (Faster ← → Smarter), so ←/→ (and vi h/l) move the selection.
         if self.effort_picker.visible {
             match key.code {
                 KeyCode::Esc => self.effort_picker.close(),
-                KeyCode::Up | KeyCode::Char('k') => self.effort_picker.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.effort_picker.select_next(),
+                KeyCode::Left | KeyCode::Char('h') => self.effort_picker.select_prev(),
+                KeyCode::Right | KeyCode::Char('l') => self.effort_picker.select_next(),
                 KeyCode::Enter => {
+                    // Applying `Ultracode` here is equivalent to typing the
+                    // `ultracode` keyword: it sets the effort to the top level.
                     let chosen = self.effort_picker.current();
                     self.effort_level = chosen;
                     self.effort_picker.close();
@@ -3619,9 +3595,7 @@ impl App {
                         // so re-prefixing would produce nonsense like
                         // `free/free/auto`.
                         let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-                        let full_model = if provider == "anthropic" {
-                            model_id.clone()
-                        } else if provider == "free" {
+                        let full_model = if provider == "anthropic" || provider == "free" {
                             model_id.clone()
                         } else {
                             format!("{}/{}", provider, model_id)
@@ -4409,7 +4383,7 @@ impl App {
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
                 } else if !self.is_streaming && self.prompt_input.is_empty() {
-                    // Cycle agent mode: build → plan → explore → build
+                    // Cycle agent mode: build → plan → build
                     self.cycle_agent_mode();
                     self.rustle_look_down();
                 }
@@ -4621,11 +4595,10 @@ impl App {
                 self.pending_mcp_reconnect = true;
                 self.status_message = Some("Reconnecting MCP runtime...".to_string());
             }
-            KeyCode::Char(c) if key.modifiers.is_empty() => {
-                if self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList {
+            KeyCode::Char(c) if key.modifiers.is_empty()
+                && self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList => {
                     self.mcp_view.push_search_char(c);
                 }
-            }
             _ => {}
         }
         false
@@ -4692,11 +4665,10 @@ impl App {
             }
             KeyCode::PageUp => self.diff_viewer.scroll_detail_up(),
             KeyCode::PageDown => self.diff_viewer.scroll_detail_down(),
-            KeyCode::Char(' ') => {
-                if self.diff_viewer.active_pane == DiffPane::FileList {
+            KeyCode::Char(' ')
+                if self.diff_viewer.active_pane == DiffPane::FileList => {
                     self.diff_viewer.toggle_file_collapse();
                 }
-            }
             _ => {}
         }
     }
@@ -5312,7 +5284,6 @@ impl App {
                         // If this is the prefix-allow option ('P'), record the prefix.
                         self.maybe_record_bash_prefix();
                         self.permission_request = None;
-                        return;
                     }
                 }
             }
@@ -5633,6 +5604,7 @@ impl App {
     /// If the pasted text resolves to an existing filesystem path:
     ///   - image files (png/jpg/gif/webp/bmp) → added as an image attachment pill
     ///   - other files → inserted as `@path` mention text
+    ///
     /// Otherwise the text goes through the normal `prompt_input.paste()` path
     /// which applies the multi-line summary placeholder for large pastes.
     fn handle_paste_data(&mut self, data: String) {
@@ -5723,28 +5695,23 @@ impl App {
         let mut buf = String::new();
         buf.push(first);
 
-        loop {
-            match crossterm::event::poll(std::time::Duration::ZERO) {
-                Ok(true) => {
-                    match crossterm::event::read() {
-                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
-                            match k.code {
-                                KeyCode::Char(c) => buf.push(c),
-                                KeyCode::Enter => buf.push('\n'),
-                                _ => {
-                                    // Non-character key — save it for replay.
-                                    self.pending_key = Some(k);
-                                    break;
-                                }
-                            }
+        while let Ok(true) = crossterm::event::poll(std::time::Duration::ZERO) {
+            match crossterm::event::read() {
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                    match k.code {
+                        KeyCode::Char(c) => buf.push(c),
+                        KeyCode::Enter => buf.push('\n'),
+                        _ => {
+                            // Non-character key — save it for replay.
+                            self.pending_key = Some(k);
+                            break;
                         }
-                        // Non-key event (mouse, resize, …) — leave in queue by
-                        // not reading it; we already checked poll() so it will
-                        // be re-read next iteration. But we already read it, so
-                        // we just break (the event is consumed but benign).
-                        _ => break,
                     }
                 }
+                // Non-key event (mouse, resize, …) — leave in queue by
+                // not reading it; we already checked poll() so it will
+                // be re-read next iteration. But we already read it, so
+                // we just break (the event is consumed but benign).
                 _ => break,
             }
         }
@@ -6347,6 +6314,44 @@ impl App {
                 });
             }
 
+            // Drain background recent-sessions results into the welcome screen.
+            if let Some(ref mut rx) = self.recent_sessions_rx {
+                match rx.try_recv() {
+                    Ok(sessions) => {
+                        self.recent_sessions = sessions;
+                        self.recent_sessions_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.recent_sessions_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
+            // Spawn the one-shot recent-sessions load when requested (startup).
+            if self.recent_sessions_pending {
+                self.recent_sessions_pending = false;
+                let root = self.project_root();
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                self.recent_sessions_rx = Some(rx);
+                tokio::spawn(async move {
+                    // Show at most a handful; list_sessions is already newest-first.
+                    const MAX_RECENT: usize = 5;
+                    let summaries = claurst_core::session_storage::list_sessions(&root)
+                        .await
+                        .unwrap_or_default();
+                    let recent: Vec<RecentSession> = summaries
+                        .into_iter()
+                        .take(MAX_RECENT)
+                        .map(|s| RecentSession {
+                            label: recent_session_label(s.title, s.last_prompt),
+                            mtime: s.mtime,
+                        })
+                        .collect();
+                    let _ = tx.send(recent).await;
+                });
+            }
+
             // Drain voice transcription events (non-blocking).
             // When the background recording/transcription task emits a
             // TranscriptReady event we insert the text directly into the
@@ -6644,6 +6649,48 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    // ---- recent-activity label (issue #277) ----
+
+    #[test]
+    fn recent_session_label_prefers_title() {
+        let label = recent_session_label(
+            Some("My Title".to_string()),
+            Some("some prompt".to_string()),
+        );
+        assert_eq!(label, "My Title");
+    }
+
+    #[test]
+    fn recent_session_label_falls_back_to_first_prompt_line() {
+        let label = recent_session_label(
+            None,
+            Some("  fix the bug\nand more details".to_string()),
+        );
+        assert_eq!(label, "fix the bug");
+    }
+
+    #[test]
+    fn recent_session_label_skips_blank_title_and_untitled_default() {
+        // Blank/whitespace title is ignored in favour of the prompt.
+        assert_eq!(
+            recent_session_label(Some("   ".to_string()), Some("do it".to_string())),
+            "do it"
+        );
+        // Nothing usable → untitled.
+        assert_eq!(recent_session_label(None, None), "(untitled)");
+        assert_eq!(
+            recent_session_label(Some(String::new()), Some("\n\n".to_string())),
+            "(untitled)"
+        );
+    }
+
+    #[test]
+    fn recent_session_label_truncates_long_prompt() {
+        let long = "x".repeat(200);
+        let label = recent_session_label(None, Some(long));
+        assert_eq!(label.chars().count(), 80);
     }
 
     // ---- mouse capture gate (issue #104) ----

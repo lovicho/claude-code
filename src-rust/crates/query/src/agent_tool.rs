@@ -272,7 +272,7 @@ impl Tool for AgentTool {
                     if let Ok(entries) = std::fs::read_dir(&agent_dir) {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.extension().map_or(false, |e| e == "md") {
+                            if p.extension().is_some_and(|e| e == "md") {
                                 if let Ok(content) = std::fs::read_to_string(&p) {
                                     let name = p
                                         .file_stem()
@@ -366,6 +366,12 @@ impl Tool for AgentTool {
             agent_definition: None,
             model_registry: Some(model_registry),
             managed_agents: None,
+            // Progressive tool disclosure (issue #233): the sub-agent's system
+            // prompt only needs guideline blocks for the tools it actually has.
+            enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
+            // Sub-agents run to their own completion and never drive goal
+            // continuation — stop after one turn like every non-goal run.
+            continuation: crate::continuation::ContinuationMode::Default,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -635,6 +641,11 @@ pub fn init_team_swarm_runner() {
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
                     provider_registry: Some(Arc::new(provider_registry)),
                     model_registry: Some(model_registry),
+                    // Progressive tool disclosure (issue #233): only emit
+                    // per-tool guidance for tools this team sub-agent has.
+                    enabled_tools: Some(
+                        agent_tools.iter().map(|t| t.name().to_string()).collect(),
+                    ),
                     ..Default::default()
                 };
 

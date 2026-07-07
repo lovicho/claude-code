@@ -17,14 +17,14 @@ use std::pin::Pin;
 
 use async_stream::stream;
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, MessageContent, Role, ToolResultContent, UsageInfo};
 use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::error_handling::parse_error_response;
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
@@ -226,13 +226,13 @@ impl BedrockProvider {
                 mac.update(service.as_bytes());
                 mac.finalize().into_bytes()
             };
-            let k_signing = {
+            
+            {
                 let mut mac = HmacSha256::new_from_slice(&k_service)
                     .expect("HMAC init failed");
                 mac.update(b"aws4_request");
                 mac.finalize().into_bytes()
-            };
-            k_signing
+            }
         };
 
         let signature = {
@@ -342,6 +342,10 @@ impl BedrockProvider {
         }
     }
 
+    // `role` is threaded through to the recursive calls for tool-result blocks
+    // to keep the Converse mapping symmetric; keep the parameter rather than
+    // dropping it and changing the recursion's shape.
+    #[allow(clippy::only_used_in_recursion)]
     fn content_block_to_converse(block: &ContentBlock, role: &Role) -> Option<Value> {
         match block {
             ContentBlock::Text { text } => Some(json!({ "text": text })),
@@ -716,35 +720,6 @@ impl LlmProvider for BedrockProvider {
         };
 
         Ok(Box::pin(s))
-    }
-
-    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(vec![
-            ModelInfo {
-                id: ModelId::new("anthropic.claude-opus-4-6"),
-                provider_id: self.id.clone(),
-                name: "Claude Opus 4.6 (Bedrock)".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 32_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("anthropic.claude-sonnet-4-6"),
-                provider_id: self.id.clone(),
-                name: "Claude Sonnet 4.6 (Bedrock)".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 16_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("anthropic.claude-haiku-4-5-20251001"),
-                provider_id: self.id.clone(),
-                name: "Claude Haiku 4.5 (Bedrock)".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 8_192,
-                ..Default::default()
-            },
-        ])
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
@@ -1138,6 +1113,11 @@ fn drain_event_stream_frames(
 ) -> Vec<Result<StreamEvent, ProviderError>> {
     let mut out = Vec::new();
 
+    // Kept as an explicit `loop`: each frame's payload is parsed into an owned
+    // value inside the match arm to release the `buf` borrow before we drain the
+    // consumed frame below — a `while let` binding on `buf` would hold that
+    // borrow across the mutation and fail to compile.
+    #[allow(clippy::while_let_loop)]
     loop {
         // Parse the payload into an owned value inside the match arm so the
         // borrow on `buf` is released before we drain the consumed frame below.

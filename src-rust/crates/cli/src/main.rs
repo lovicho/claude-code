@@ -8,6 +8,10 @@
 //    - Headless (--print / -p) mode: single query, output to stdout
 //    - Interactive REPL mode: full TUI with ratatui
 
+// too_many_arguments: the top-level interactive/headless runners thread many
+// parameters; grouping them into structs is a larger refactor out of scope here.
+#![allow(clippy::too_many_arguments)]
+
 mod oauth_flow;
 mod codex_oauth_flow;
 mod upgrade;
@@ -756,7 +760,7 @@ async fn main() -> anyhow::Result<()> {
     // but we guard with a std::sync::OnceLock internally).
     {
         static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        SWARM_INIT.get_or_init(|| claurst_query::init_team_swarm_runner());
+        SWARM_INIT.get_or_init(claurst_query::init_team_swarm_runner);
     }
 
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
@@ -979,14 +983,10 @@ fn models_dev_cache_path() -> PathBuf {
 /// Implementation of the `claurst models` subcommand.
 ///
 /// Flags:
-///   * `--refresh`   — force-fetch from models.dev (ignoring the 5-minute
-///                     freshness window), then list.
-///   * `--verbose`   — also print release date, status, modalities,
-///                     cache pricing, and capability flags.
-///   * `--json`      — emit the registry as a JSON object keyed by
-///                     `provider/model` (suitable for piping into `jq`).
-///   * `<provider>`  — first non-flag arg filters by provider id
-///                     (e.g. `claurst models openai`).
+/// * `--refresh` — force-fetch from models.dev (ignoring the 5-minute freshness window), then list.
+/// * `--verbose` — also print release date, status, modalities, cache pricing, and capability flags.
+/// * `--json` — emit the registry as a JSON object keyed by `provider/model` (suitable for piping into `jq`).
+/// * `<provider>` — first non-flag arg filters by provider id (e.g. `claurst models openai`).
 async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
     let mut refresh = false;
     let mut verbose = false;
@@ -1038,14 +1038,14 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
     // Stable order: provider id, then by descending release_date so newest
     // models appear first.
     entries.sort_by(|a, b| {
-        (&*a.info.provider_id)
+        (*a.info.provider_id)
             .cmp(&*b.info.provider_id)
             .then_with(|| {
                 let rd_a = a.release_date.as_deref().unwrap_or("");
                 let rd_b = b.release_date.as_deref().unwrap_or("");
                 rd_b.cmp(rd_a)
             })
-            .then_with(|| (&*a.info.id).cmp(&*b.info.id))
+            .then_with(|| (*a.info.id).cmp(&*b.info.id))
     });
 
     if as_json {
@@ -1199,7 +1199,34 @@ fn spawn_models_cache_refresh() {
         tracing::debug!("CLAURST_DISABLE_MODELS_FETCH set — skipping models.dev refresh");
         return;
     }
+    tokio::spawn(async move {
+        refresh_models_cache_once().await;
+    });
+}
 
+/// TUI-startup analogue of opencode's `ModelsDev` background refresh
+/// (models-dev.ts:233-236): fire one refresh now (gated by the 5-minute TTL),
+/// then repeat spaced ~60 minutes so a long-running session keeps a fresh
+/// catalog on disk for the `/model` picker to reload. Non-blocking — the UI is
+/// never held on the network.
+fn spawn_models_cache_refresh_loop() {
+    if std::env::var("CLAURST_DISABLE_MODELS_FETCH").is_ok() {
+        tracing::debug!("CLAURST_DISABLE_MODELS_FETCH set — skipping models.dev refresh loop");
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            refresh_models_cache_once().await;
+            tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        }
+    });
+}
+
+/// Fetch the models.dev catalog into the on-disk cache once, honoring the
+/// 5-minute mtime freshness check (mirrors opencode `ModelsDev.fresh()`). All
+/// network/parse failures are silent — the bundled snapshot is always
+/// sufficient.
+async fn refresh_models_cache_once() {
     let cache_path = models_cache_path();
     let legacy_cache_path = models_dev_cache_path();
     let ttl = std::time::Duration::from_secs(5 * 60);
@@ -1209,43 +1236,41 @@ fn spawn_models_cache_refresh() {
         return;
     }
 
-    tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let url = models_source_url();
-        let resp = match client
-            .get(&url)
-            .header("User-Agent", concat!("Claurst/", env!("CARGO_PKG_VERSION")))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(err) => {
-                tracing::debug!(?err, "models.dev refresh: network error");
-                return;
-            }
-        };
-        if !resp.status().is_success() {
-            tracing::debug!(status = ?resp.status(), "models.dev refresh: non-2xx");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = models_source_url();
+    let resp = match client
+        .get(&url)
+        .header("User-Agent", concat!("Claurst/", env!("CARGO_PKG_VERSION")))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::debug!(?err, "models.dev refresh: network error");
             return;
         }
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        if let Some(parent) = cache_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Write canonical path + legacy path so older installs keep working.
-        let _ = std::fs::write(&cache_path, &text);
-        let _ = std::fs::write(&legacy_cache_path, &text);
-        tracing::info!(path = %cache_path.display(), "Models cache refreshed from {}", url);
-    });
+    };
+    if !resp.status().is_success() {
+        tracing::debug!(status = ?resp.status(), "models.dev refresh: non-2xx");
+        return;
+    }
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Write canonical path + legacy path so older installs keep working.
+    let _ = std::fs::write(&cache_path, &text);
+    let _ = std::fs::write(&legacy_cache_path, &text);
+    tracing::info!(path = %cache_path.display(), "Models cache refreshed from {}", url);
 }
 
 async fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<()> {
@@ -1761,6 +1786,14 @@ async fn run_interactive(
     };
     let initial_messages = session.messages.clone();
     let mut base_query_config = query_config;
+    // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
+    // run_query_loop itself decides whether to continue toward an active goal
+    // after each turn, instead of the REPL re-dispatching a fresh turn. Select
+    // the goal policy for interactive user turns when the /goal feature is on;
+    // the GoalPolicy is a no-op (stops after one turn) when no goal is active.
+    if claurst_core::goals_enabled() {
+        base_query_config.continuation = claurst_query::ContinuationMode::Goal;
+    }
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -1788,24 +1821,21 @@ async fn run_interactive(
         app.status_message = Some(warning);
     }
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
+    // The TUI and query effort types are now the same canonical enum, so this is
+    // a direct assignment.
     if let Some(level) = base_query_config.effort_level {
-        use claurst_tui::EffortLevel as TuiEL;
-        app.effort_level = match level {
-            claurst_core::effort::EffortLevel::Low    => TuiEL::Low,
-            claurst_core::effort::EffortLevel::Medium => TuiEL::Normal,
-            claurst_core::effort::EffortLevel::High   => TuiEL::High,
-            claurst_core::effort::EffortLevel::Max    => TuiEL::Max,
-        };
+        app.effort_level = level;
     }
     app.provider_registry = base_query_config.provider_registry.clone();
     app.refresh_context_window_size();
     app.auto_compact_enabled = live_config.auto_compact;
 
-    // Background: refresh the model registry from models.dev.
-    // The fetched JSON is saved as a cache file; the App will reload it from
-    // disk whenever the /model picker opens.
+    // Background: keep the model registry fresh from models.dev for the whole
+    // TUI session (opencode-style: refresh now, then every ~60 min, gated by a
+    // 5-min TTL). The fetched JSON is saved as a cache file; the App reloads it
+    // from disk whenever the /model picker opens. Non-blocking.
     {
-        spawn_models_cache_refresh();
+        spawn_models_cache_refresh_loop();
     }
 
     // Wire the ask-user question channel into the app so the TUI can show
@@ -2001,8 +2031,6 @@ async fn run_interactive(
     // Active effort level (None = use model default / High).
     // Tracks the user's /effort selection; flows into qcfg each turn.
     let mut current_effort: Option<claurst_core::effort::EffortLevel> = None;
-    // Timestamp of when the most recent query turn was dispatched (for goal elapsed tracking).
-    let mut goal_turn_start: std::time::Instant = std::time::Instant::now();
 
     // Background update check: spawned once at startup; result delivered via channel.
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -2100,9 +2128,20 @@ async fn run_interactive(
             None
         };
 
+        // Repaint cadence. The loop already polls at ~60fps for the streaming
+        // spinner; the effort picker's animated ultracode spectrum can be open
+        // while idle, so cap the poll interval to at least ~30fps whenever it is
+        // showing (frame_count advances every draw, moving the spectrum). This is
+        // a no-op unless the base cadence is ever relaxed, and it does NOT tick
+        // faster when the picker is closed.
+        let poll_timeout = if app.effort_picker.wants_animation() {
+            Duration::from_millis(16).min(Duration::from_millis(33))
+        } else {
+            Duration::from_millis(16)
+        };
         let evt_opt: Option<Event> = if let Some(e) = synthetic_event {
             Some(e)
-        } else if crossterm::event::poll(Duration::from_millis(16))? {
+        } else if crossterm::event::poll(poll_timeout)? {
             Some(event::read()?)
         } else {
             None
@@ -2214,16 +2253,7 @@ async fn run_interactive(
                             // Sync effort level when TUI cycled the visual indicator
                             // (no-args /effort → cycle Low→Med→High→Max→Low).
                             if handled_by_tui && cmd_name == "effort" && cmd_args.is_empty() {
-                                current_effort = Some(match app.effort_level {
-                                    claurst_tui::EffortLevel::Low =>
-                                        claurst_core::effort::EffortLevel::Low,
-                                    claurst_tui::EffortLevel::Normal =>
-                                        claurst_core::effort::EffortLevel::Medium,
-                                    claurst_tui::EffortLevel::High =>
-                                        claurst_core::effort::EffortLevel::High,
-                                    claurst_tui::EffortLevel::Max =>
-                                        claurst_core::effort::EffortLevel::Max,
-                                });
+                                current_effort = Some(app.effort_level);
                             }
 
                             // Honour exit/quit triggered by TUI intercept immediately.
@@ -2252,6 +2282,83 @@ async fn run_interactive(
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message =
                                         Some("Conversation cleared.".to_string());
+                                }
+                                Some(CommandResult::NewSession) => {
+                                    // Fresh lazy-home session (opencode /new):
+                                    // preserve the current model / provider / effort
+                                    // selection and working directory. The new
+                                    // session is only persisted once the first
+                                    // message completes a turn, matching opencode's
+                                    // lazy-session semantics.
+                                    let model = claurst_api::effective_model_for_config(
+                                        &cmd_ctx.config,
+                                        &model_registry,
+                                    );
+                                    session = claurst_commands::build_home_session(
+                                        model,
+                                        Some(tool_ctx.working_dir.display().to_string()),
+                                    );
+                                    messages.clear();
+                                    app.replace_messages(Vec::new());
+                                    tool_ctx.session_id = session.id.clone();
+                                    cmd_ctx.session_id = session.id.clone();
+                                    cmd_ctx.session_title = None;
+                                    // Reset per-turn diff/turn bookkeeping, as
+                                    // ResumeSession does when swapping sessions.
+                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                                        claurst_core::file_history::FileHistory::new(),
+                                    ));
+                                    tool_ctx.current_turn = Arc::new(
+                                        std::sync::atomic::AtomicUsize::new(0),
+                                    );
+                                    app.attach_turn_diff_state(
+                                        tool_ctx.file_history.clone(),
+                                        tool_ctx.current_turn.clone(),
+                                    );
+                                    claurst_tui::update_terminal_title(None);
+                                    app.status_message =
+                                        Some("Started a new session.".to_string());
+                                }
+                                Some(CommandResult::MoveSession {
+                                    destination,
+                                    moved_changes,
+                                }) => {
+                                    // Re-home the live session to the destination
+                                    // worktree (opencode /move). The working-tree
+                                    // changes were already relocated inside the
+                                    // command; here we repoint every cwd-aware
+                                    // surface so tools, the system prompt and the
+                                    // saved session all track the new location.
+                                    tool_ctx.working_dir = destination.clone();
+                                    cmd_ctx.working_dir = destination.clone();
+                                    cmd_ctx.config.project_dir = Some(destination.clone());
+                                    tool_ctx.config.project_dir = Some(destination.clone());
+                                    app.config.project_dir = Some(destination.clone());
+                                    base_query_config.working_directory =
+                                        Some(destination.display().to_string());
+                                    session.working_dir =
+                                        Some(destination.display().to_string());
+                                    session.updated_at = chrono::Utc::now();
+                                    let _ =
+                                        claurst_core::history::save_session(&session).await;
+                                    // NOTE: opencode appends a synthetic
+                                    // <system-reminder> prompt after a move. claurst
+                                    // re-derives working_directory into every turn's
+                                    // system prompt (qcfg.working_directory below),
+                                    // so repointing tool_ctx.working_dir already
+                                    // tells the model on its next turn — we skip the
+                                    // dangling user message that would otherwise
+                                    // break user/assistant role alternation.
+                                    let carried = if moved_changes {
+                                        " (carried over uncommitted changes)"
+                                    } else {
+                                        ""
+                                    };
+                                    app.status_message = Some(format!(
+                                        "Moved session to {}{}",
+                                        destination.display(),
+                                        carried
+                                    ));
                                 }
                                 Some(CommandResult::SetMessages(new_msgs)) => {
                                     let removed =
@@ -2383,11 +2490,6 @@ async fn run_interactive(
                                             }
                                         }
                                     }
-                                }
-                                Some(CommandResult::SpeechMode { mode, level }) => {
-                                    app.set_speech_mode(mode.as_deref(), &level);
-                                    cmd_ctx.config = app.config.clone();
-                                    tool_ctx.config = app.config.clone();
                                 }
                                 Some(CommandResult::McpAuthFlow {
                                     server_name,
@@ -2569,16 +2671,7 @@ async fn run_interactive(
                                     claurst_core::effort::EffortLevel::from_str(&cmd_args)
                                 {
                                     current_effort = Some(level);
-                                    app.effort_level = match level {
-                                        claurst_core::effort::EffortLevel::Low =>
-                                            claurst_tui::EffortLevel::Low,
-                                        claurst_core::effort::EffortLevel::Medium =>
-                                            claurst_tui::EffortLevel::Normal,
-                                        claurst_core::effort::EffortLevel::High =>
-                                            claurst_tui::EffortLevel::High,
-                                        claurst_core::effort::EffortLevel::Max =>
-                                            claurst_tui::EffortLevel::Max,
-                                    };
+                                    app.effort_level = level;
                                     app.status_message = Some(format!(
                                         "Effort: {} {}",
                                         app.effort_level.symbol(),
@@ -2776,16 +2869,9 @@ async fn run_interactive(
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
                         qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
-                        // Inject active goal addendum into system prompt (if goals enabled).
-                        if let Some(goal) = claurst_core::GoalStore::open_default()
-                            .and_then(|s| s.get_active_goal(&session.id))
-                        {
-                            let addendum = claurst_core::goal_system_prompt_addendum(&goal);
-                            qcfg.append_system_prompt = Some(match qcfg.append_system_prompt {
-                                Some(existing) => format!("{}\n{}", existing, addendum),
-                                None => addendum,
-                            });
-                        }
+                        // The active-goal system-prompt addendum is now injected
+                        // inside run_query_loop per turn (issue #230 / MI-3), so
+                        // it also covers in-loop continuation turns.
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
@@ -2803,7 +2889,6 @@ async fn run_interactive(
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
-                        goal_turn_start = std::time::Instant::now();
 
                         let handle = tokio::spawn(async move {
                             let mut msgs = msgs_arc_clone.lock().await.clone();
@@ -2873,10 +2958,7 @@ async fn run_interactive(
                                                 }
                                             }
                                             Some('p') => {
-                                                let mut settings = match claurst_core::config::Settings::load_sync() {
-                                                    Ok(s) => s,
-                                                    Err(_) => claurst_core::config::Settings::default(),
-                                                };
+                                                let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
                                                 if let Some(path) = selected_path.as_deref() {
                                                     let pattern = format!("{}*", path);
                                                     let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
@@ -2909,7 +2991,7 @@ async fn run_interactive(
                     if !app.model_name.is_empty() {
                         session.model = app.model_name.clone();
                     }
-                    // Handle agent mode change (Tab key cycles build→plan→explore)
+                    // Handle agent mode change (Tab key cycles build→plan)
                     if app.agent_mode_changed {
                         app.agent_mode_changed = false;
                         let mode = app.agent_mode.as_deref().unwrap_or("build");
@@ -3126,6 +3208,9 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                // Auto-compact is a maintenance turn, not a goal turn: never let
+                // it trigger in-loop goal continuation.
+                qcfg.continuation = claurst_query::ContinuationMode::Default;
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
@@ -3222,15 +3307,14 @@ async fn run_interactive(
                                         Ok(msgs) if !msgs.is_empty() => {
                                             for msg in &msgs {
                                                 since_id = Some(msg.id.clone());
-                                                if msg.role == "user" {
-                                                    if poll_tx
+                                                if msg.role == "user"
+                                                    && poll_tx
                                                         .send(msg.content.clone())
                                                         .await
                                                         .is_err()
                                                     {
                                                         return;
                                                     }
-                                                }
                                             }
                                         }
                                         _ => {}
@@ -3415,13 +3499,8 @@ async fn run_interactive(
 
         // Drain CLAUDE_STATUS_COMMAND results (most recent wins)
         if status_cmd_str.is_some() {
-            loop {
-                match status_cmd_rx.try_recv() {
-                    Ok(text) => {
-                        app.status_line_override = if text.is_empty() { None } else { Some(text) };
-                    }
-                    Err(_) => break,
-                }
+            while let Ok(text) = status_cmd_rx.try_recv() {
+                app.status_line_override = if text.is_empty() { None } else { Some(text) };
             }
         }
 
@@ -3446,14 +3525,16 @@ async fn run_interactive(
                         .strip_prefix(&provider_prefix)
                         .unwrap_or(app.model_name.as_str())
                         .to_string();
-                    // Only let a live-discovery result replace the list when it
-                    // actually returned models. An empty result — catalog-backed
-                    // provider (now the trait default), an unreachable endpoint,
-                    // or a missing entitlement — must never wipe the registry
-                    // projection set when the picker opened.
-                    if !entries.is_empty() {
-                        app.model_picker.set_models(entries);
-                    }
+                    // Additively merge the live-discovery result onto the
+                    // catalog projection already loaded when the picker opened,
+                    // mirroring opencode's github-copilot models.ts merge-by-id
+                    // (models.ts:229-255): keep the catalog metadata for ids in
+                    // both, append only live ids not already listed. An empty
+                    // result — catalog-backed provider (now the trait default),
+                    // an unreachable endpoint, or a missing entitlement — is a
+                    // no-op and never wipes the projection. For copilot the id
+                    // IS the api.id, so this is the by-api.id merge.
+                    app.model_picker.merge_models(entries);
                     for m in &mut app.model_picker.models {
                         m.is_current = m.id == current;
                     }
@@ -3760,114 +3841,25 @@ async fn run_interactive(
                     }
                 }
 
-                // --- Goal continuation ---
-                // After every completed turn check if there is an active goal.
-                // If so, inject a continuation user message and dispatch another turn
-                // without waiting for user input.
-                if !app.auto_compact_running && claurst_core::goals_enabled() {
-                    let elapsed_secs = goal_turn_start.elapsed().as_secs();
-                    let total_tokens = cost_tracker.total_tokens();
-                    match claurst_query::check_and_continue_goal(
-                        &session.id,
-                        total_tokens,
-                        elapsed_secs,
-                    ) {
-                        claurst_query::GoalContinuation::Continue { message } => {
-                            // Show a subtle status notice.
-                            app.status_message = Some(
-                                "Goal: continuing autonomously… (use /goal pause to stop)".to_string()
-                            );
-                            // Update the footer badge.
-                            if let Some(goal) = claurst_core::GoalStore::open_default()
-                                .and_then(|s| s.get_active_goal(&session.id))
-                            {
-                                app.active_goal_badge = Some(format!(
-                                    "active · {} · {} turns",
-                                    goal.elapsed_display(),
-                                    goal.turns_used
-                                ));
-                            }
-
-                            // Inject the continuation message into the conversation.
-                            let cont_msg = claurst_core::types::Message::user(message);
-                            messages.push(cont_msg.clone());
-                            app.push_message(cont_msg);
-                            session.messages = messages.clone();
-                            session.updated_at = chrono::Utc::now();
-                            app.is_streaming = true;
-                            app.streaming_text.clear();
-
-                            let ct = CancellationToken::new();
-                            cancel = Some(ct.clone());
-
-                            let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
-                            let msgs_arc_clone = msgs_arc.clone();
-                            let tools_arc_clone = tools_arc.clone();
-                            let mut ctx_clone = tool_ctx.clone();
-                            let mut qcfg = base_query_config.clone();
-                            qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                            qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                            qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
-                            qcfg.system_prompt = base_query_config.system_prompt.clone();
-                            qcfg.output_style = cmd_ctx.config.effective_output_style();
-                            qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
-                            qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
-                            // Re-inject the goal addendum for this continuation turn.
-                            if let Some(goal) = claurst_core::GoalStore::open_default()
-                                .and_then(|s| s.get_active_goal(&session.id))
-                            {
-                                let addendum = claurst_core::goal_system_prompt_addendum(&goal);
-                                qcfg.append_system_prompt = Some(match qcfg.append_system_prompt {
-                                    Some(existing) => format!("{}\n{}", existing, addendum),
-                                    None => addendum,
-                                });
-                            }
-                            if let Some(level) = current_effort {
-                                qcfg.effort_level = Some(level);
-                            }
-                            if let Some(ref cq) = qcfg.command_queue {
-                                let cq = cq.clone();
-                                ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
-                                    cq.push(
-                                        claurst_query::QueuedCommand::InjectSystemMessage(msg),
-                                        claurst_query::CommandPriority::Normal,
-                                    );
-                                }));
-                            }
-                            let tracker = cost_tracker.clone();
-                            let tx = event_tx.clone();
-                            let client_clone = client.clone();
-                            goal_turn_start = std::time::Instant::now();
-
-                            let handle = tokio::spawn(async move {
-                                let mut msgs = msgs_arc_clone.lock().await.clone();
-                                let outcome = claurst_query::run_query_loop(
-                                    client_clone.as_ref(),
-                                    &mut msgs,
-                                    tools_arc_clone.as_slice(),
-                                    &ctx_clone,
-                                    &qcfg,
-                                    tracker,
-                                    Some(tx),
-                                    ct,
-                                    None,
-                                )
-                                .await;
-                                *msgs_arc_clone.lock().await = msgs;
-                                outcome
-                            });
-                            current_query = Some((handle, msgs_arc));
-                        }
-                        claurst_query::GoalContinuation::Stop { reason } => {
-                            app.active_goal_badge = None;
-                            if let Some(msg) = reason.user_message() {
-                                app.status_message = Some(msg);
-                            }
-                        }
-                        claurst_query::GoalContinuation::NoGoal => {
-                            app.active_goal_badge = None;
-                        }
-                    }
+                // --- Goal continuation (issue #230 / MI-3) ---
+                // Continuation toward an active goal is now decided *inside*
+                // run_query_loop by the goal continuation policy, so the REPL no
+                // longer re-dispatches a follow-up turn here. All that remains
+                // post-loop is to refresh the footer badge from the store: once
+                // the loop returns the goal is paused / complete / budget-limited
+                // (or absent), so this clears the badge in the common case. The
+                // paused / budget / runaway notes are surfaced live from within
+                // the loop via QueryEvent::Status.
+                if claurst_core::goals_enabled() {
+                    app.active_goal_badge = claurst_core::GoalStore::open_default()
+                        .and_then(|s| s.get_active_goal(&session.id))
+                        .map(|goal| {
+                            format!(
+                                "active · {} · {} turns",
+                                goal.elapsed_display(),
+                                goal.turns_used
+                            )
+                        });
                 }
             }
         }

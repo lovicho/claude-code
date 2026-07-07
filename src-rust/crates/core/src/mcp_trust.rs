@@ -139,7 +139,7 @@ impl McpTrustStore {
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         // Write-then-rename so a concurrent reader never sees a half-written
         // (corrupt) trust file. Rename is atomic within the same directory.
         let tmp = path.with_extension("json.tmp");
@@ -278,7 +278,7 @@ mod tests {
         session.insert(server_fingerprint(&p));
         let store = McpTrustStore::default();
         // Same identity: allowed.
-        let d = partition_mcp_servers(&[p.clone()], None, false, &session, &store);
+        let d = partition_mcp_servers(std::slice::from_ref(&p), None, false, &session, &store);
         assert_eq!(d.allowed.len(), 1);
         assert!(d.pending.is_empty());
         // Different command under the same name: re-prompted (not allowed).
@@ -337,7 +337,7 @@ mod tests {
 
         // A persisted approval clears the gate even with no session trust.
         let d = partition_mcp_servers(
-            &[server.clone()],
+            std::slice::from_ref(&server),
             Some(root.as_path()),
             false,
             &HashSet::new(),

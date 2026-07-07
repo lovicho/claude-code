@@ -1,13 +1,13 @@
-/// Integration tests for ShadowSnapshot — ported from opencode's snapshot.test.ts.
-///
-/// Each test:
-///   1. Creates a real temp git repo
-///   2. Makes file changes
-///   3. Exercises ShadowSnapshot methods
-///   4. Asserts filesystem + return-value invariants
-///
-/// Tests are async and require git to be on PATH.  They are skipped gracefully
-/// when git is unavailable.
+//! Integration tests for ShadowSnapshot — ported from opencode's snapshot.test.ts.
+//!
+//! Each test:
+//! 1. Creates a real temp git repo
+//! 2. Makes file changes
+//! 3. Exercises ShadowSnapshot methods
+//! 4. Asserts filesystem + return-value invariants
+//!
+//! Tests are async and require git to be on PATH.  They are skipped gracefully
+//! when git is unavailable.
 
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -168,7 +168,7 @@ async fn binary_file_tracked_and_reverted() {
     let snap = snap_or_skip(p);
 
     let before = snap.track().await.expect("track");
-    fs::write(p.join("image.png"), &[0x89u8, 0x50, 0x4e, 0x47]).unwrap();
+    fs::write(p.join("image.png"), [0x89u8, 0x50, 0x4e, 0x47]).unwrap();
 
     let patch = snap.patch(&before).await;
     assert!(patch.files.contains(&fwd(p, "image.png")), "binary file in patch");

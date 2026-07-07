@@ -3,6 +3,10 @@
 // Each tool maps to a capability the LLM can invoke: running shell commands,
 // reading/writing/editing files, searching codebases, fetching web pages, etc.
 
+// type_complexity: the REPL tool holds a boxed session-callback map whose full
+// type is unwieldy; a type alias would not meaningfully improve readability.
+#![allow(clippy::type_complexity)]
+
 use async_trait::async_trait;
 use claurst_core::config::PermissionMode;
 use claurst_core::cost::CostTracker;
@@ -523,6 +527,23 @@ pub trait Tool: Send + Sync {
     ///   `ctx.check_permission*` in `execute()`), so the central gate must NOT
     ///   also prompt — this prevents double-prompting.
     fn self_gates(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool is "advanced" / rarely used and a candidate for
+    /// deferred (on-demand) disclosure rather than being sent in every request.
+    ///
+    /// Defaults to `false` (always disclosed). This is purely a metadata hint
+    /// today — the prompt/tool-definition layer can read it to decide which
+    /// tools to omit from the initial request and surface only via `ToolSearch`.
+    ///
+    // TODO(#233): wire this into the request assembly so `advanced()` tools are
+    // omitted from the initial `tools` array and loaded on demand. That requires
+    // a mutable *active tool set* tracked across turns inside `run_query_loop`,
+    // which is under active refactor on other branches and intentionally left
+    // untouched here. Land the tracking + gated re-injection there, then have
+    // `all_tools()` callers filter on `advanced()` for the first request.
+    fn advanced(&self) -> bool {
         false
     }
 

@@ -49,6 +49,12 @@ pub mod providers;
 // Model Registry (Phase 3).
 pub mod model_registry;
 
+// Model-adaptive effort ladders (#267).
+pub mod effort_support;
+
+// opencode variants() effort ladder port (Phase 2, #268).
+pub mod variants;
+
 // Provider-aware error handling (Phase 6).
 pub mod error_handling;
 
@@ -88,6 +94,10 @@ pub use providers::OpenAiProvider;
 pub use model_registry::{
     CostBreakdown, ExperimentalMode, InterleavedReasoning, Modality, ModelEntry, ModelRegistry,
     ModelStatus, ProviderEntry, ProviderOverride, effective_model_for_config,
+};
+pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
+pub use variants::{
+    variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
 };
 
 // Phase 6 re-exports — provider-aware error handling.
@@ -463,18 +473,16 @@ pub mod client {
 
     /// Provider selection for API calls.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Default)]
     pub enum Provider {
         /// Use Anthropic's API
+        #[default]
         Anthropic,
         /// Use OpenAI Codex via OAuth
         Codex,
     }
 
-    impl Default for Provider {
-        fn default() -> Self {
-            Provider::Anthropic
-        }
-    }
+    
 
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
@@ -1381,6 +1389,12 @@ enum PartialBlock {
         thinking_buf: String,
         signature_buf: String,
     },
+}
+
+impl Default for StreamAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StreamAccumulator {

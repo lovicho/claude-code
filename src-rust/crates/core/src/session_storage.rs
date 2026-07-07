@@ -266,8 +266,17 @@ pub fn transcript_dir_in(config_dir: &Path, project_root: &Path) -> PathBuf {
 }
 
 /// Returns the full path to a session's JSONL transcript file.
-pub fn transcript_path(project_root: &Path, session_id: &str) -> PathBuf {
-    transcript_dir(project_root).join(format!("{}.jsonl", session_id))
+///
+/// # Errors
+/// Returns `crate::ClaudeError::Other` if `session_id` contains path components
+/// (`/`, `\`, or `..`) that could be used for directory traversal (issue #204).
+pub fn transcript_path(project_root: &Path, session_id: &str) -> crate::Result<PathBuf> {
+    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+        return Err(crate::ClaudeError::Other(
+            "session_id contains illegal characters".into(),
+        ));
+    }
+    Ok(transcript_dir(project_root).join(format!("{}.jsonl", session_id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -354,10 +363,8 @@ pub async fn load_transcript(path: &Path) -> crate::Result<Vec<TranscriptEntry>>
         }
         // Cheap structural check before full parse.
         if trimmed.contains("\"type\":\"tombstone\"") || trimmed.contains("\"type\": \"tombstone\"") {
-            if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(trimmed) {
-                if let TranscriptEntry::Tombstone(t) = entry {
-                    tombstoned.insert(t.deleted_uuid);
-                }
+            if let Ok(TranscriptEntry::Tombstone(t)) = serde_json::from_str::<TranscriptEntry>(trimmed) {
+                tombstoned.insert(t.deleted_uuid);
             }
         }
     }
@@ -454,7 +461,7 @@ pub async fn list_sessions_in(
     }
 
     // Sort newest-first.
-    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.mtime));
     Ok(sessions)
 }
 
@@ -484,12 +491,11 @@ pub async fn truncate_after(path: &Path, from_uuid: &str) -> crate::Result<()> {
     for entry in entries {
         if found { continue; }
         match &entry {
-            TranscriptEntry::User(m) | TranscriptEntry::Assistant(m) => {
-                if m.message.uuid.as_deref() == Some(from_uuid) {
+            TranscriptEntry::User(m) | TranscriptEntry::Assistant(m)
+                if m.message.uuid.as_deref() == Some(from_uuid) => {
                     found = true;
                     continue; // drop this entry and everything after
                 }
-            }
             _ => {}
         }
         keep.push(entry);
@@ -607,13 +613,13 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
 
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = file;
-    if let Err(_) = file
+    if file
         .seek(std::io::SeekFrom::Start(offset))
-        .await
+        .await.is_err()
     {
         return (None, None);
     }
-    if let Err(_) = file.read_exact(&mut buf).await {
+    if file.read_exact(&mut buf).await.is_err() {
         return (None, None);
     }
 
@@ -632,10 +638,8 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
             && (trimmed.contains("\"type\":\"last-prompt\"")
                 || trimmed.contains("\"type\": \"last-prompt\""))
         {
-            if let Ok(e) = serde_json::from_str::<TranscriptEntry>(trimmed) {
-                if let TranscriptEntry::LastPrompt(lp) = e {
-                    last_prompt = Some(lp.last_prompt);
-                }
+            if let Ok(TranscriptEntry::LastPrompt(lp)) = serde_json::from_str::<TranscriptEntry>(trimmed) {
+                last_prompt = Some(lp.last_prompt);
             }
         }
 
@@ -643,10 +647,8 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
             && (trimmed.contains("\"type\":\"custom-title\"")
                 || trimmed.contains("\"type\": \"custom-title\""))
         {
-            if let Ok(e) = serde_json::from_str::<TranscriptEntry>(trimmed) {
-                if let TranscriptEntry::CustomTitle(ct) = e {
-                    title = Some(ct.custom_title);
-                }
+            if let Ok(TranscriptEntry::CustomTitle(ct)) = serde_json::from_str::<TranscriptEntry>(trimmed) {
+                title = Some(ct.custom_title);
             }
         }
 
@@ -1200,7 +1202,7 @@ mod tests {
     #[test]
     fn transcript_path_encoding_is_reversible() {
         let root = Path::new("/Users/alice/my-project");
-        let path = transcript_path(root, "test-session");
+        let path = transcript_path(root, "test-session").unwrap();
         // The directory component after "projects/" should decode back to the root.
         let encoded_dir = path
             .parent()

@@ -58,7 +58,7 @@ static CRON_STORE: Lazy<Arc<RwLock<HashMap<String, CronTask>>>> =
 
 /// Path to `~/.claurst/scheduled_tasks.json`.
 fn scheduled_tasks_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claurst").join("scheduled_tasks.json"))
+    Some(claurst_core::config::Settings::config_dir().join("scheduled_tasks.json"))
 }
 
 /// Ensure the store has been loaded from disk (once per process).
@@ -134,7 +134,7 @@ fn cron_field_matches(field: &str, value: u32) -> bool {
     // */N step
     if let Some(step_str) = field.strip_prefix("*/") {
         if let Ok(step) = step_str.parse::<u32>() {
-            return step > 0 && value % step == 0;
+            return step > 0 && value.is_multiple_of(step);
         }
     }
     // Comma-separated list of values or ranges
@@ -153,7 +153,7 @@ fn cron_range_matches(part: &str, value: u32) -> bool {
         value >= lo && value <= hi
     } else {
         part.parse::<u32>()
-            .map_or(false, |n| n == value || (n == 7 && value == 0)) // 7 = Sunday alias
+            .is_ok_and(|n| n == value || (n == 7 && value == 0)) // 7 = Sunday alias
     }
 }
 
@@ -226,8 +226,7 @@ fn cron_to_human(expr: &str) -> String {
     if expr == "* * * * *" {
         return "every minute".to_string();
     }
-    if minute.starts_with("*/") {
-        let n = &minute[2..];
+    if let Some(n) = minute.strip_prefix("*/") {
         return format!("every {} minutes", n);
     }
     if hour == "*" && dom == "*" && month == "*" && dow == "*" {

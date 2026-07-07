@@ -3,6 +3,14 @@
 //
 // All sub-modules are defined inline below.
 
+// too_many_arguments: several config-import and permission-resolution helpers
+// legitimately thread many parameters; grouping them into structs is a larger
+// refactor out of scope for this cleanup.
+#![allow(clippy::too_many_arguments)]
+// should_implement_trait: intentional inherent `from_str` constructors that
+// return domain-specific types, not the std `FromStr` trait.
+#![allow(clippy::should_implement_trait)]
+
 // Branded provider / model identifier newtypes.
 pub mod provider_id;
 pub use provider_id::{ProviderId, ModelId};
@@ -90,6 +98,7 @@ pub use skill_discovery::{DiscoveredSkill, discover_skills, parse_skill_file};
 pub use cost::CostTracker;
 pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;
+pub use paths::claurst_home;
 pub use permissions::{
     AutoPermissionHandler, InteractivePermissionHandler,
     ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
@@ -776,8 +785,10 @@ pub mod config {
     /// Budget allocation strategy between manager and executor agents.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
+    #[derive(Default)]
     pub enum BudgetSplitPolicy {
         /// Shared pool — no split (default).
+        #[default]
         SharedPool,
         /// Manager gets manager_pct% of total budget.
         Percentage { manager_pct: u8 },
@@ -785,9 +796,7 @@ pub mod config {
         FixedCaps { manager_usd: f64, executor_usd: f64 },
     }
 
-    impl Default for BudgetSplitPolicy {
-        fn default() -> Self { BudgetSplitPolicy::SharedPool }
-    }
+    
 
     /// Configuration for manager-executor agent architecture.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1236,6 +1245,7 @@ pub mod config {
 
     /// Configuration for a file formatter tool.
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Default)]
     pub struct FormatterConfig {
         /// Command to run, e.g. `["prettier", "--write"]`.
         pub command: Vec<String>,
@@ -1246,11 +1256,7 @@ pub mod config {
         pub disabled: bool,
     }
 
-    impl Default for FormatterConfig {
-        fn default() -> Self {
-            Self { command: Vec::new(), extensions: Vec::new(), disabled: false }
-        }
-    }
+    
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct ProjectSettings {
@@ -1451,6 +1457,7 @@ pub mod config {
         /// Returns `(credential, use_bearer_auth)`.
         /// - For Console OAuth flow: credential is the stored API key, bearer=false.
         /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
+        ///
         /// Silently attempts token refresh when the access token is expired.
         pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
             if self.selected_provider_id() != "anthropic" {
@@ -1514,11 +1521,7 @@ pub mod config {
                 tokens
             };
 
-            if let Some(cred) = tokens.effective_credential() {
-                Some((cred.to_string(), tokens.uses_bearer_auth()))
-            } else {
-                None
-            }
+            tokens.effective_credential().map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
         }
 
         pub fn resolve_provider_api_base(&self, provider_id: &str) -> Option<String> {
@@ -1572,11 +1575,45 @@ pub mod config {
     }
 
     impl Settings {
-        /// The per-user configuration directory (`~/.claurst`).
+        /// The canonical per-user claurst home directory — the single source of
+        /// truth for where claurst keeps everything (settings, sessions,
+        /// accounts, skills, …). Every subdirectory (`config_dir().join("sessions")`,
+        /// `.join("accounts")`, …) lives under this one root.
+        ///
+        /// Resolution precedence (see issue #207 — XDG Base Directory support,
+        /// kept fully back-compatible so existing installs are untouched):
+        ///
+        /// 1. **`$CLAURST_HOME`** — if set and non-empty, used verbatim.
+        /// 2. **Legacy `~/.claurst`** — if that directory already exists, it is
+        ///    reused so existing users need no migration.
+        /// 3. **XDG** — `$XDG_CONFIG_HOME/claurst` when `$XDG_CONFIG_HOME` is set
+        ///    (and absolute, per the spec), otherwise `~/.config/claurst`. Fresh
+        ///    installs land here.
         pub fn config_dir() -> PathBuf {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".claurst")
+            // 1. Explicit override wins, used verbatim.
+            if let Some(explicit) = std::env::var_os("CLAURST_HOME") {
+                if !explicit.is_empty() {
+                    return PathBuf::from(explicit);
+                }
+            }
+
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+
+            // 2. Back-compat: an existing legacy `~/.claurst` is used as-is.
+            let legacy = home.join(".claurst");
+            if legacy.is_dir() {
+                return legacy;
+            }
+
+            // 3. XDG config location for fresh installs.
+            if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                let xdg = PathBuf::from(xdg);
+                // Per the XDG spec a relative $XDG_CONFIG_HOME must be ignored.
+                if xdg.is_absolute() {
+                    return xdg.join("claurst");
+                }
+            }
+            home.join(".config").join("claurst")
         }
 
         /// Full path to the global settings JSON file.
@@ -1933,8 +1970,7 @@ pub mod config {
 
         #[test]
         fn global_request_timeout_serde_roundtrips_with_camelcase_key() {
-            let mut config = Config::default();
-            config.request_timeout_secs = Some(1800);
+            let config = Config { request_timeout_secs: Some(1800), ..Default::default() };
             // Serialises with the documented camelCase key.
             let json = serde_json::to_string(&config).expect("serialise");
             assert!(
@@ -1966,10 +2002,8 @@ pub mod config {
 
         #[test]
         fn per_provider_override_wins_over_global() {
-            let mut config = Config::default();
-            config.request_timeout_secs = Some(1200);
-            let mut provider = ProviderConfig::default();
-            provider.request_timeout_secs = Some(3600);
+            let mut config = Config { request_timeout_secs: Some(1200), ..Default::default() };
+            let provider = ProviderConfig { request_timeout_secs: Some(3600), ..Default::default() };
             config
                 .provider_configs
                 .insert("ollama".to_string(), provider);
@@ -1983,8 +2017,7 @@ pub mod config {
         fn effective_config_merges_top_level_provider_timeout() {
             let mut settings = Settings::default();
             settings.config.request_timeout_secs = Some(1200);
-            let mut provider = ProviderConfig::default();
-            provider.request_timeout_secs = Some(3600);
+            let provider = ProviderConfig { request_timeout_secs: Some(3600), ..Default::default() };
             settings.providers.insert("ollama".to_string(), provider);
             let config = settings.effective_config();
             assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
@@ -1993,8 +2026,7 @@ pub mod config {
 
         #[test]
         fn zero_is_treated_as_unset() {
-            let mut config = Config::default();
-            config.request_timeout_secs = Some(0);
+            let config = Config { request_timeout_secs: Some(0), ..Default::default() };
             assert_eq!(
                 config.resolve_request_timeout_secs("openai"),
                 DEFAULT_REQUEST_TIMEOUT_SECS
@@ -2179,10 +2211,10 @@ pub mod context {
         async fn find_and_read_claude_md(&self) -> Option<String> {
             let mut claude_mds = vec![];
 
-            // Global ~/.claurst/AGENTS.md
-            if let Some(home) = dirs::home_dir() {
-                let global_claude_md =
-                    home.join(".claurst").join(crate::constants::CLAUDE_MD_FILENAME);
+            // Global <claurst home>/AGENTS.md
+            {
+                let global_claude_md = crate::config::Settings::config_dir()
+                    .join(crate::constants::CLAUDE_MD_FILENAME);
                 if global_claude_md.exists() {
                     if let Ok(content) = tokio::fs::read_to_string(&global_claude_md).await {
                         claude_mds.push(format!(
@@ -2773,9 +2805,7 @@ pub mod permissions {
             match self.mode {
                 PermissionMode::BypassPermissions => PermissionDecision::Allow,
                     PermissionMode::AcceptEdits => {
-                        if request.tool_name == "Edit" {
-                            PermissionDecision::Allow
-                        } else if request.is_read_only {
+                        if request.tool_name == "Edit" || request.is_read_only {
                             PermissionDecision::Allow
                         } else {
                             PermissionDecision::Deny
@@ -3303,25 +3333,22 @@ pub mod history {
         }
 
         let mut sessions = vec![];
-        match tokio::fs::read_dir(&dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                            if let Ok(session) =
-                                serde_json::from_str::<ConversationSession>(&content)
-                            {
-                                sessions.push(session);
-                            }
+        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        if let Ok(session) =
+                            serde_json::from_str::<ConversationSession>(&content)
+                        {
+                            sessions.push(session);
                         }
                     }
                 }
             }
-            Err(_) => {}
         }
 
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         sessions
     }
 
@@ -3512,9 +3539,7 @@ pub mod cost {
         /// Pick pricing based on model name substring matching.
         pub fn for_model(model: &str) -> Self {
             // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
-            if model.ends_with("-free") || model.starts_with("free/") {
-                Self::FREE
-            } else if is_free_upstream_model(model) {
+            if model.ends_with("-free") || model.starts_with("free/") || is_free_upstream_model(model) {
                 Self::FREE
             } else if model.contains("opus") {
                 Self::OPUS
@@ -3855,10 +3880,7 @@ pub mod oauth {
         /// Legacy token file path — kept for backward-compat reads when no
         /// account registry exists yet. New writes go to per-account dirs.
         pub fn token_file_path() -> std::path::PathBuf {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".claurst")
-                .join("oauth_tokens.json")
+            crate::config::Settings::config_dir().join("oauth_tokens.json")
         }
 
         /// Save tokens for a specific account profile under
@@ -3926,7 +3948,7 @@ pub mod oauth {
 
             let profile = AccountProfile {
                 id: id.clone(),
-                label: label.map(|l| slugify_profile_id(l)),
+                label: label.map(slugify_profile_id),
                 email: self.email.clone(),
                 account_id: self.account_uuid.clone(),
                 organization_uuid: self.organization_uuid.clone(),
@@ -4125,10 +4147,12 @@ pub mod remote_settings;
 pub mod settings_sync;
 pub mod import_config;
 pub mod effort;
+pub mod keywords;
 pub mod prompt_history;
 pub mod bash_classifier;
 pub mod ps_classifier;
 pub mod mcp_trust;
+pub mod paths;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
@@ -4418,8 +4442,7 @@ mod tests {
 
     #[test]
     fn test_config_mouse_capture_explicit_off() {
-        let mut cfg = crate::config::Config::default();
-        cfg.mouse_capture = Some(false);
+        let mut cfg = crate::config::Config { mouse_capture: Some(false), ..Default::default() };
         assert!(!cfg.mouse_capture_enabled());
         cfg.mouse_capture = Some(true);
         assert!(cfg.mouse_capture_enabled());
@@ -4437,8 +4460,7 @@ mod tests {
         assert!(back.mouse_capture_enabled());
 
         // Explicit off serializes the key and round-trips as disabled.
-        let mut cfg = crate::config::Config::default();
-        cfg.mouse_capture = Some(false);
+        let cfg = crate::config::Config { mouse_capture: Some(false), ..Default::default() };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"mouseCapture\":false"));
         let back: crate::config::Config = serde_json::from_str(&json).unwrap();
@@ -4454,8 +4476,7 @@ mod tests {
 
     #[test]
     fn test_config_effective_model_override() {
-        let mut cfg = crate::config::Config::default();
-        cfg.model = Some("claude-haiku-4-5-20251001".to_string());
+        let cfg = crate::config::Config { model: Some("claude-haiku-4-5-20251001".to_string()), ..Default::default() };
         assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
     }
 
@@ -4467,8 +4488,7 @@ mod tests {
 
     #[test]
     fn test_config_effective_max_tokens_override() {
-        let mut cfg = crate::config::Config::default();
-        cfg.max_tokens = Some(8192);
+        let cfg = crate::config::Config { max_tokens: Some(8192), ..Default::default() };
         assert_eq!(cfg.effective_max_tokens(), 8192);
     }
 
@@ -4479,8 +4499,7 @@ mod tests {
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
-        let mut cfg = crate::config::Config::default();
-        cfg.api_key = Some("sk-ant-config-key".to_string());
+        let cfg = crate::config::Config { api_key: Some("sk-ant-config-key".to_string()), ..Default::default() };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
 
         if let Some(k) = orig {

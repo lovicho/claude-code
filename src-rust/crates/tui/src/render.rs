@@ -79,15 +79,15 @@ fn spinner_char(frame_count: u64) -> char {
     SPINNER[(frame_count as usize) % SPINNER.len()]
 }
 
-/// Returns the colour to use for the streaming spinner.
-/// Turns red when no stream data has arrived for more than 3 seconds.
+/// Returns the colour to use for the streaming spinner: claurst red normally,
+/// brightening to a hot red when no stream data has arrived for over 3 seconds.
 fn spinner_color(app: &App) -> Color {
     if let Some(start) = app.stall_start {
         if start.elapsed() > std::time::Duration::from_secs(3) {
-            return Color::Red;
+            return Color::Rgb(255, 70, 70);
         }
     }
-    Color::Yellow
+    CLAUDE_ORANGE
 }
 
 fn is_modal_open(app: &App) -> bool {

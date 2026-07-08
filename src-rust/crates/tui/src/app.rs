@@ -248,6 +248,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "anthropic-oauth".into(), title: "Anthropic (Claude Pro/Max)".into(), description: "(subscription — browser login; draws from extra-usage)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "custom-openai".into(), title: "Custom OpenAI-Compatible".into(), description: "Custom URL + API key".into(), category: "Advanced".into(), badge: None },
         SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
@@ -917,6 +918,11 @@ pub struct App {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
+    /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
+    /// login) so the main loop re-resolves credentials and swaps in a fresh
+    /// client + provider registry. Without it the session keeps the client built
+    /// at startup, which for a fresh OAuth login still has no usable credential.
+    pub pending_provider_reload: bool,
     /// Pending MCP panel-auth request for the interactive loop.
     pub pending_mcp_panel_auth: Option<String>,
     /// Shared file-history service used for turn diff reconstruction.
@@ -1318,6 +1324,7 @@ impl App {
             remote_session_url: None,
             mcp_manager: None,
             pending_mcp_reconnect: false,
+            pending_provider_reload: false,
             pending_mcp_panel_auth: None,
             file_history: None,
             current_turn: None,
@@ -2840,6 +2847,12 @@ impl App {
         pending
     }
 
+    pub fn take_pending_provider_reload(&mut self) -> bool {
+        let pending = self.pending_provider_reload;
+        self.pending_provider_reload = false;
+        pending
+    }
+
     /// If a project MCP server is waiting for approval and no approval dialog
     /// is currently open, pop the next one and show the approval dialog for it.
     ///
@@ -3211,6 +3224,24 @@ impl App {
                         let provider_id = self.device_auth_dialog.provider_id.clone();
                         let provider_name = self.device_auth_dialog.provider_name.clone();
                         let token = token.clone();
+                        if provider_id == "anthropic-oauth" {
+                            // The claude.ai OAuth flow already persisted the Bearer
+                            // tokens via save_and_register; the anthropic provider
+                            // reads them directly. Switch to the real "anthropic"
+                            // provider without re-storing the token as an API key.
+                            self.device_auth_pending = None;
+                            self.device_auth_dialog.close();
+                            self.activate_provider(
+                                "anthropic".to_string(),
+                                "Anthropic".to_string(),
+                                "Connected to",
+                            );
+                            // The live client was built at startup with no
+                            // credential; ask the main loop to re-resolve the
+                            // freshly-saved Bearer and swap in a working client.
+                            self.pending_provider_reload = true;
+                            return false;
+                        }
                         let credential = if provider_id == "github-copilot" {
                             claurst_core::StoredCredential::OAuthToken {
                                 access: token.clone(),
@@ -3450,9 +3481,16 @@ impl App {
                                 self.free_mode_dialog.open(&existing);
                             }
                             "anthropic" => {
-                                // Anthropic: use API key from console.anthropic.com
-                                // (OAuth requires a registered app which Claurst doesn't have)
+                                // Anthropic: API key from console.anthropic.com.
                                 self.key_input_dialog.open(selected.id.clone(), selected.title.clone());
+                            }
+                            "anthropic-oauth" => {
+                                // Claude Pro/Max subscription: claude.ai OAuth via
+                                // the browser (loopback capture), spawned by the
+                                // main loop. Note: usage draws from the account's
+                                // extra-usage pool, not subscription quota.
+                                self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
+                                self.device_auth_pending = Some("anthropic-oauth".to_string());
                             }
                             "custom-openai" => {
                                 let current_url = Settings::load_sync()

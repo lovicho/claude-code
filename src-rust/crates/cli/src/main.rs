@@ -1353,6 +1353,49 @@ async fn refresh_provider_runtime_state(
     })
 }
 
+/// Non-destructive counterpart to [`refresh_provider_runtime_state`]: re-resolve
+/// credentials for the CURRENT provider (e.g. right after an in-session OAuth
+/// login) and rebuild the client + provider registry, keeping the active
+/// provider and model. Mirrors the startup resolution so a just-completed
+/// Claude Pro/Max login works without a restart.
+async fn reload_provider_runtime_state(
+    current_config: &Config,
+) -> anyhow::Result<RefreshedProviderRuntime> {
+    let config = current_config.clone();
+
+    let (api_key, use_bearer_auth) = if config.selected_provider_id() == "anthropic" {
+        config
+            .resolve_anthropic_auth_async()
+            .await
+            .unwrap_or((String::new(), false))
+    } else {
+        (config.resolve_api_key().unwrap_or_default(), false)
+    };
+
+    claurst_api::set_request_timeout_secs(config.resolve_request_timeout_secs_active());
+    let client_config = claurst_api::client::ClientConfig {
+        api_key,
+        api_base: config.resolve_anthropic_api_base(),
+        use_bearer_auth,
+        ..Default::default()
+    };
+    let client = Arc::new(
+        claurst_api::AnthropicClient::new(client_config.clone())
+            .context("Failed to rebuild Anthropic client")?,
+    );
+    let provider_registry =
+        Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
+    let model_registry = load_cached_model_registry();
+
+    Ok(RefreshedProviderRuntime {
+        config,
+        client,
+        provider_registry,
+        model_registry,
+        auth_store: claurst_core::AuthStore::default(),
+    })
+}
+
 fn normalize_provider_from_model(config: &mut Config) {
     if let Some(model) = config.model.as_deref() {
         if let Some((provider, _)) = model.split_once('/') {
@@ -2079,6 +2122,14 @@ async fn run_interactive(
     // any flash.
     let mut last_scroll_offset = app.scroll_offset;
     let mut last_auto_scroll = app.auto_scroll;
+    // The terminal progress bar (OSC 9;4) is opt-out via the terminalProgressBar
+    // setting; read it once at startup. `progress_shown` tracks whether we've
+    // told the terminal we're "busy", so the escape is only emitted on an actual
+    // streaming-state edge.
+    let progress_bar_enabled = claurst_core::config::Settings::load_sync()
+        .map(|s| s.terminal_progress_bar)
+        .unwrap_or(true);
+    let mut progress_shown = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
@@ -2114,6 +2165,15 @@ async fn run_interactive(
 
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
+
+        // Level-sync the terminal progress indicator (OSC 9;4) to streaming
+        // state, so supporting terminals (iTerm2, WezTerm, Windows Terminal, …)
+        // show a "working" bar while a turn is active and clear it when idle.
+        let want_progress = app.is_streaming && progress_bar_enabled;
+        if want_progress != progress_shown {
+            claurst_tui::set_terminal_progress(want_progress);
+            progress_shown = want_progress;
+        }
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
@@ -3534,7 +3594,19 @@ async fn run_interactive(
                     // an unreachable endpoint, or a missing entitlement — is a
                     // no-op and never wipes the projection. For copilot the id
                     // IS the api.id, so this is the by-api.id merge.
-                    app.model_picker.merge_models(entries);
+                    //
+                    // Anthropic is the exception: its discovery result is the
+                    // subscription/key set already intersected with the catalog,
+                    // so we REPLACE (dropping legacy claude-3.x the credential
+                    // can't serve). An empty result (discovery failed / offline)
+                    // is a no-op that keeps the full catalog projection.
+                    if provider == "anthropic" {
+                        if !entries.is_empty() {
+                            app.model_picker.set_models(entries);
+                        }
+                    } else {
+                        app.model_picker.merge_models(entries);
+                    }
                     for m in &mut app.model_picker.models {
                         m.is_current = m.id == current;
                     }
@@ -3578,6 +3650,19 @@ async fn run_interactive(
                 .clone()
                 .or_else(|| app.config.provider.clone())
                 .unwrap_or_else(|| "anthropic".to_string());
+            let is_anthropic = provider_id_str == "anthropic";
+            // For Anthropic, live `/v1/models` discovery is the authoritative set
+            // the credential can use; intersect it with the rich catalog
+            // projection so we keep context/cost metadata for known ids but drop
+            // models the subscription/key can't serve (e.g. legacy claude-3.x).
+            let anthropic_catalog: Vec<claurst_tui::model_picker::ModelEntry> = if is_anthropic {
+                claurst_tui::model_picker::models_for_provider_from_registry(
+                    "anthropic",
+                    model_registry.as_ref(),
+                )
+            } else {
+                Vec::new()
+            };
             if let Some(ref registry) = app.provider_registry {
                 let pid = claurst_core::ProviderId::new(&provider_id_str);
                 if let Some(provider) = registry.get(&pid) {
@@ -3588,17 +3673,46 @@ async fn run_interactive(
                     tokio::spawn(async move {
                         match provider.discover_models().await {
                             Ok(models) => {
-                                let entries: Vec<claurst_tui::model_picker::ModelEntry> = models
-                                    .into_iter()
-                                    .map(|m| claurst_tui::model_picker::ModelEntry {
-                                        id: m.id.to_string(),
-                                        display_name: m.name.clone(),
-                                        description: claurst_tui::model_picker::format_context_window(
-                                            m.context_window,
-                                        ),
-                                        is_current: false,
-                                    })
-                                    .collect();
+                                let entries: Vec<claurst_tui::model_picker::ModelEntry> =
+                                    if is_anthropic && !models.is_empty() {
+                                        let by_id: std::collections::HashMap<
+                                            String,
+                                            claurst_tui::model_picker::ModelEntry,
+                                        > = anthropic_catalog
+                                            .into_iter()
+                                            .map(|e| (e.id.clone(), e))
+                                            .collect();
+                                        models
+                                            .into_iter()
+                                            .map(|m| {
+                                                let id = m.id.to_string();
+                                                by_id.get(&id).cloned().unwrap_or_else(|| {
+                                                    claurst_tui::model_picker::ModelEntry {
+                                                        id: id.clone(),
+                                                        display_name: m.name.clone(),
+                                                        description:
+                                                            claurst_tui::model_picker::format_context_window(
+                                                                m.context_window,
+                                                            ),
+                                                        is_current: false,
+                                                    }
+                                                })
+                                            })
+                                            .collect()
+                                    } else {
+                                        models
+                                            .into_iter()
+                                            .map(|m| claurst_tui::model_picker::ModelEntry {
+                                                id: m.id.to_string(),
+                                                display_name: m.name.clone(),
+                                                description:
+                                                    claurst_tui::model_picker::format_context_window(
+                                                        m.context_window,
+                                                    ),
+                                                is_current: false,
+                                            })
+                                            .collect()
+                                    };
                                 let _ = tx.send(Ok(entries)).await;
                             }
                             Err(_) => {
@@ -3669,16 +3783,30 @@ async fn run_interactive(
                         }
                     });
                 }
-                "anthropic" => {
+                "anthropic-oauth" => {
                     let tx2 = device_auth_tx.clone();
-                    // Anthropic OAuth requires a registered application.
-                    // Claurst does not have its own registered OAuth app with Anthropic.
-                    // Users should use an API key from console.anthropic.com instead.
+                    // Claude Pro/Max subscription login: claude.ai OAuth (Bearer).
+                    // Runs the loopback flow in the background and surfaces the URL
+                    // to the dialog; the flow persists the tokens itself
+                    // (save_and_register), so the success handler only switches to
+                    // the anthropic provider. Usage draws from the account's
+                    // extra-usage pool, not subscription quota.
                     tokio::spawn(async move {
-                        let _ = tx2.send(DeviceAuthEvent::Error(
-                            "Anthropic OAuth requires a registered application.\n\
-                             Use an API key instead: console.anthropic.com/settings/keys".to_string()
-                        )).await;
+                        match oauth_flow::run_oauth_login_flow_tui(tx2.clone(), true, None).await {
+                            Ok(_) => {
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::TokenReceived("connected".to_string()))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::Error(format!(
+                                        "Anthropic login failed: {}",
+                                        e
+                                    )))
+                                    .await;
+                            }
+                        }
                     });
                 }
                 "codex" | "openai-codex" => {
@@ -3904,6 +4032,42 @@ async fn run_interactive(
                         "MCP auth is unavailable because the MCP runtime is not connected."
                             .to_string(),
                     );
+                }
+            }
+        }
+
+        if !app.is_streaming && current_query.is_none() && app.take_pending_provider_reload() {
+            // A provider was just connected in-session (e.g. a Claude Pro/Max
+            // OAuth login). Re-resolve credentials and swap in a fresh client +
+            // provider registry so the current session can use them immediately,
+            // without a restart. The client built at startup had no credential.
+            // `activate_provider` updated `app.config` (not `cmd_ctx.config`), so
+            // snapshot it as the resolution source — and snapshot up-front so we
+            // don't hold a borrow of `app` across the await.
+            let reload_source = app.config.clone();
+            match reload_provider_runtime_state(&reload_source).await {
+                Ok(refreshed) => {
+                    cmd_ctx.config = refreshed.config.clone();
+                    tool_ctx.config = refreshed.config.clone();
+                    base_query_config.provider_registry =
+                        Some(refreshed.provider_registry.clone());
+                    base_query_config.model_registry = Some(refreshed.model_registry.clone());
+                    base_query_config.model = claurst_api::effective_model_for_config(
+                        &cmd_ctx.config,
+                        refreshed.model_registry.as_ref(),
+                    );
+                    client = refreshed.client;
+                    model_registry = refreshed.model_registry;
+                    session.model = claurst_api::effective_model_for_config(
+                        &cmd_ctx.config,
+                        model_registry.as_ref(),
+                    );
+                    app.provider_registry = Some(refreshed.provider_registry);
+                    app.has_credentials = true;
+                }
+                Err(err) => {
+                    app.status_message =
+                        Some(format!("Could not activate credentials: {}", err));
                 }
             }
         }

@@ -31,6 +31,30 @@ global settings):
 Settings that appear in the project file override the corresponding global
 values. Keys absent from the project file fall back to the global value.
 
+A project settings file comes from the repository and is treated as untrusted.
+Settings that run commands, fetch URLs, redirect provider traffic, or widen what
+the agent may do without asking are **global-only**: Claurst reads them only from
+the global settings file and ignores them (with a warning in the log) when a
+project file sets them:
+
+| Global-only setting | Why |
+|---------------------|-----|
+| `hooks` (every event) | Runs shell commands |
+| `formatter` (top-level and `config.formatter`) | Runs a command after every file write |
+| `lsp_servers` | Spawns language-server processes |
+| `skills.urls` (top-level and `config.skills.urls`) | Clones the URL with git |
+| `providers` / `config.provider_configs` | Can point the API base URL, and your API key, at another host |
+| `workspace_paths`, `additional_dirs` | Widen the auto-allowed read set |
+| `permission_mode`, `permissionRules`, `allowedBashPrefixes`, `skipDangerousModePermissionPrompt` | Grant or pre-approve permissions |
+| `trustProjectMcpServers` | Bypasses the project MCP server approval prompt |
+| `enabledPlugins` | Enables plugins, which can ship hooks and servers |
+| `remoteControlAtStartup` | Exposes the session over the remote-control bridge |
+
+Project-defined MCP servers are still read from the project file, but they do
+not launch until you approve them for that project (or set
+`trustProjectMcpServers` globally). `skills.paths` from a project file is merged
+with the global list.
+
 ---
 
 ## Top-level Settings Structure
@@ -59,6 +83,36 @@ live in the `providers` map. Corrected model metadata for self-hosted or
 unknown models lives in the `modelOverrides` map — see
 [Model metadata overrides](providers.md#overriding-model-metadata).
 
+### Terminal status reporting
+
+The interactive TUI reports its state to the terminal through two escape
+sequences. Both are top-level settings, default to `true`, are read once at
+startup, and are never emitted by headless (`--print`), ACP, or bridge modes.
+
+| Key | Sequence | Description |
+|-----|----------|-------------|
+| `terminalProgressBar` | OSC 9;4 | Busy indicator while a turn is streaming. Only sent to terminals known to render it (iTerm2, WezTerm, Ghostty, Windows Terminal, ConEmu), and never inside tmux/screen. |
+| `terminalProgramStatus` | OSC 7501 | [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) reports, so terminals and session managers that support it (Rex, cmux) can show which tab is working, waiting on you, or finished. Terminals without support ignore it. Skipped when stdout is not a tty, `TERM=dumb`, or inside tmux/screen. |
+
+OSC 7501 reports use the root record with `app=claurst`:
+
+| State | When |
+|-------|------|
+| `idle` | At startup, after a cancelled turn, and once you start typing after a finished turn. |
+| `working` | A turn is in flight: the model is streaming or tools are running. |
+| `blocked` | Waiting on you. `kind=permission` for a tool permission or MCP server approval, `kind=question` for an AskUserQuestion prompt, `kind=auth` for a device/browser sign-in. Carries a short base64 `msg`. |
+| `done` | The last turn finished and the prompt is waiting. |
+| `error` | The last turn ended in an error. |
+
+On a normal exit Claurst sends `state=clear` to remove its record. If it crashes it reports `state=error` instead, so the tab still shows that something went wrong.
+
+```json
+{
+  "terminalProgressBar": true,
+  "terminalProgramStatus": false
+}
+```
+
 ---
 
 ## The `config` Object
@@ -73,12 +127,15 @@ The `config` object holds runtime behaviour options.
 | `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (e.g. `claude-sonnet-4-6` for Anthropic, `gpt-4o` for OpenAI). |
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
+| `effort` | string \| null | unset | Reasoning effort for new turns: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultracode"`. When unset, no thinking-budget or temperature override is applied at all — this is not the same as `"medium"`, which has its own explicit values. |
+| `degradationSummaryEnabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Applies to sub-agents as well. Unset means enabled. Note the camelCase key. |
 
 ### Permission mode
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `permission_mode` | string | `"default"` | Controls how tool permissions are enforced. One of `"default"`, `"acceptEdits"`, `"bypassPermissions"`, `"plan"`. |
+| `yoloMode` | boolean | `false` | Persistent YOLO mode: the effective permission mode is `bypassPermissions`. Global-only in the settings merge: a project settings file cannot enable it. |
 
 See [Permission Modes](#permission-modes) for a full description of each value.
 
@@ -186,6 +243,40 @@ Hook entry fields:
 | `command` | string | Shell command to execute. |
 | `tool_filter` | string \| null | Only run for this tool name (`PreToolUse`/`PostToolUse` only). |
 | `blocking` | boolean | If true, a non-zero exit code blocks the operation. Default: false. |
+
+### External status line
+
+`config.statusLine` runs a shell command periodically and shows its stdout as a row
+above the footer, compatible with Claude Code `statusLine` scripts (for example
+the `cc-statusline` ecosystem). The command receives a JSON session payload on
+stdin (`session_id`, `cwd`, `model`, `workspace.current_dir`, `context_window`,
+`cost.total_cost_usd`, `elapsed_seconds`). In `context_window`,
+`total_input_tokens` is the number of tokens in the current context window (the
+figure `used_percentage` is derived from, not a session total), while `total_output_tokens` and the `current_usage` breakdown are cumulative
+session totals.
+
+```json
+"statusLine": {
+  "command": "~/.claurst/statusline.sh",
+  "pollIntervalMs": 5000,
+  "padding": 1,
+  "maxLines": 2
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `command` | string | required | Shell command (`sh -c`, `cmd /C` on Windows). |
+| `pollIntervalMs` | integer | 5000 | Poll interval, clamped to 1000–300000. A run that exceeds it is killed. |
+| `padding` | integer | 0 | Horizontal padding in spaces, clamped to half the terminal width. |
+| `maxLines` | integer | 10 | Maximum number of output lines shown. |
+
+Output is capped at 4 KiB, ANSI escapes and control characters are stripped,
+long lines are truncated with `...`, and stderr is discarded. Empty output hides
+the row. `statusLine` is only read from the global `~/.claurst/settings.json`;
+a project `.claurst/settings.json` cannot set or override it. The legacy
+`CLAUDE_STATUS_COMMAND` environment variable is used when `statusLine` is unset.
+Run `/cc-statusline` to show the active configuration.
 
 ---
 
@@ -407,7 +498,7 @@ and `api_base` override the corresponding environment variables.
 | `NVIDIA_API_KEY` | API key for the `nvidia` provider. |
 | `CLAURST_BRIDGE_URL` | Enable the remote-control bridge by setting the server URL. |
 | `CLAURST_BRIDGE_TOKEN` | Bearer token for the remote-control bridge. |
-| `RUST_LOG` | Tracing filter (e.g. `debug`, `claurst_core=trace`). |
+| `RUST_LOG` | Tracing filter (e.g. `debug`, `claurst_core=trace`). In the interactive TUI, logs go to `<config dir>/logs/claurst.log` (rotated to `claurst.log.old` at 5 MB) so they never draw over the screen; in headless (`--print`) mode they go to stderr. `/doctor` shows the log file path. |
 
 ---
 

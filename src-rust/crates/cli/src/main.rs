@@ -14,6 +14,7 @@
 
 mod oauth_flow;
 mod codex_oauth_flow;
+mod headless;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
@@ -43,73 +44,12 @@ use claurst_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
-use async_trait::async_trait;
-use claurst_core::types::ToolDefinition;
-use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use claurst_tools::ToolContext;
 use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
-
-// ---------------------------------------------------------------------------
-// MCP tool wrapper: makes MCP server tools look like native cc-tools.
-// ---------------------------------------------------------------------------
-
-struct McpToolWrapper {
-    tool_def: ToolDefinition,
-    server_name: String,
-    manager: Arc<claurst_mcp::McpManager>,
-}
-
-#[async_trait]
-impl Tool for McpToolWrapper {
-    fn name(&self) -> &str {
-        &self.tool_def.name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_def.description
-    }
-
-    fn permission_level(&self) -> PermissionLevel {
-        // MCP tools run external processes – treat as Execute.
-        PermissionLevel::Execute
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
-    }
-
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
-        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
-            return ToolResult::error(e.to_string());
-        }
-
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
-
-        let args = if input.is_null() { None } else { Some(input) };
-
-        match self.manager.call_tool(&self.tool_def.name, args).await {
-            Ok(result) => {
-                let text = claurst_mcp::mcp_result_to_string(&result);
-                if result.is_error {
-                    ToolResult::error(text)
-                } else {
-                    ToolResult::success(text)
-                }
-            }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
@@ -142,8 +82,8 @@ struct Cli {
     #[arg(long = "resume", num_args(0..=1), default_missing_value("__last__"))]
     resume: Option<String>,
 
-    /// Maximum number of agentic turns
-    #[arg(long = "max-turns", default_value_t = 10)]
+    /// Maximum number of agentic turns; reaching it ends a headless run with exit code 2
+    #[arg(long = "max-turns", default_value_t = claurst_core::constants::MAX_TURNS_DEFAULT)]
     max_turns: u32,
 
     /// Custom system prompt
@@ -161,6 +101,11 @@ struct Cli {
     /// Output format
     #[arg(long = "output-format", value_enum, default_value_t = CliOutputFormat::Text)]
     output_format: CliOutputFormat,
+
+    /// JSON Schema (inline JSON or a file path) for a structured final answer:
+    /// adds the StructuredOutput tool and reports its input as `structured_output`
+    #[arg(long = "json-schema", value_name = "FILE|JSON")]
+    json_schema: Option<String>,
 
     /// Enable verbose logging
     #[arg(long = "verbose", short = 'v', action = ArgAction::SetTrue)]
@@ -213,7 +158,7 @@ struct Cli {
     #[arg(long = "input-format", value_enum, default_value_t = CliInputFormat::Text)]
     input_format: CliInputFormat,
 
-    /// Session ID to tag this headless run (for tracking in logs/hooks)
+    /// Session ID for this run: continues that session if it exists, else creates it
     #[arg(long = "session-id")]
     session_id_flag: Option<String>,
 
@@ -229,7 +174,7 @@ struct Cli {
     #[arg(long = "thinking", value_name = "TOKENS")]
     thinking: Option<u32>,
 
-    /// Continue the most recent conversation
+    /// Continue the most recent session (same as --resume without an id)
     #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
     continue_session: bool,
 
@@ -253,7 +198,7 @@ struct Cli {
     #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
     disable_slash_commands: bool,
 
-    /// Run in bare mode (no hooks, no plugins, no AGENTS.md)
+    /// Run in bare mode (no hooks, no plugins, no AGENTS.md, no project skills)
     #[arg(long = "bare", action = ArgAction::SetTrue)]
     bare: bool,
 
@@ -545,6 +490,9 @@ async fn main() -> anyhow::Result<()> {
         // Bare mode runs no event hooks. Drop any hooks resolved from
         // settings so no `run_hooks` call site has anything to execute.
         config.hooks.clear();
+        // Nor does it list or run skills from the repository's own skill
+        // directories (global and bundled skills stay).
+        config.skills.skip_project_dirs = true;
     }
     if let Some(sp) = cli.system_prompt.clone() {
         config.custom_system_prompt = Some(sp);
@@ -594,36 +542,69 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
-    // --dump-system-prompt fast path
-    if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone())
-            .disable_claude_mds(config.disable_claude_mds);
-        let sys = ctx.build_system_context().await;
-        let user = ctx.build_user_context().await;
-        println!("{}\n\n{}", sys, user);
-        return Ok(());
-    }
+    // --json-schema: validated up front so a bad schema fails before any work.
+    let structured_output_tool = match cli.json_schema.as_deref() {
+        None => None,
+        Some(_) if !is_headless => anyhow::bail!("--json-schema requires --print"),
+        Some(raw) => Some(headless::structured_output_tool(raw).context("invalid --json-schema")?),
+    };
+
+    // AGENTS.md / CLAUDE.md instruction files, loaded once per session and
+    // sent in the cached system block.
+    let instruction_files = if config.disable_claude_mds {
+        Vec::new()
+    } else {
+        claurst_core::claudemd::load_instruction_files(
+            &cwd,
+            &claurst_core::claudemd::default_global_dirs(),
+        )
+    };
 
     // Build context
-    let ctx_builder = ContextBuilder::new(cwd.clone())
-        .disable_claude_mds(config.disable_claude_mds);
-    let system_ctx = ctx_builder.build_system_context().await;
-    let user_ctx = ctx_builder.build_user_context().await;
+    let system_ctx = ContextBuilder::new(cwd.clone()).build_system_context().await;
 
-    // Build system prompt
-    let mut system_parts = vec![
-        include_str!("system_prompt.txt").to_string(),
-        system_ctx,
-        user_ctx,
-    ];
-    if let Some(ref custom) = config.custom_system_prompt {
-        // replace base system prompt
-        system_parts[0] = custom.clone();
+    // Session-stable additions to the default prompt, which
+    // `claurst_core::system_prompt::build_system_prompt` assembles on its own
+    // (identity, capabilities, guidelines). Only session-stable text goes here
+    // (it lands in the cached system block); `system_ctx` (git status, IDE
+    // context) is passed separately as `session_context` and sent in the
+    // dynamic block.
+    let system_prompt = [config.custom_system_prompt.clone(), config.append_system_prompt.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // --dump-system-prompt fast path: print the stable and dynamic blocks
+    // assembled the way the first turn of this session would send them.
+    if cli.dump_system_prompt {
+        let opts = claurst_core::system_prompt::SystemPromptOptions {
+            custom_system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
+            session_context: Some(system_ctx),
+            output_style: config.effective_output_style(),
+            custom_output_style_prompt: config.resolve_output_style_prompt(),
+            working_directory: Some(cwd.display().to_string()),
+            additional_dirs: config
+                .additional_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            enabled_tools: Some(
+                claurst_tools::all_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect(),
+            ),
+            permission_mode: Some(config.permission_mode.clone()),
+            instruction_files,
+            ..Default::default()
+        };
+        let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
+        let (stable, dynamic) = claurst_core::system_prompt::split_at_dynamic_boundary(&prompt);
+        println!("{stable}\n\n{dynamic}");
+        return Ok(());
     }
-    if let Some(ref append) = config.append_system_prompt {
-        system_parts.push(append.clone());
-    }
-    let system_prompt = system_parts.join("\n\n");
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -662,6 +643,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -742,7 +724,16 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
+    // Servers connect concurrently in the background; the TUI draws
+    // immediately and picks up tools as servers finish. Headless runs have no
+    // later turn to pick them up, so they wait (bounded by the per-server
+    // connect/catalog timeouts) before the tool list is built.
+    let mcp_manager_arc = start_mcp_manager(&mcp_decision.allowed);
+    if is_headless {
+        if let Some(manager) = mcp_manager_arc.as_ref() {
+            manager.wait_until_settled().await;
+        }
+    }
 
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
@@ -850,9 +841,28 @@ async fn main() -> anyhow::Result<()> {
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
     query_config.max_turns = cli.max_turns;
-    query_config.system_prompt = Some(system_prompt);
+    query_config.system_prompt = (!system_prompt.is_empty()).then_some(system_prompt);
     query_config.append_system_prompt = None;
+    query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
+    query_config.instruction_files = instruction_files;
+    // Skills are discovered once per session: the listing goes into the
+    // cached system block, so it must not change between turns. Discovery
+    // walks the filesystem and may `git clone` skills.urls, so it runs on the
+    // blocking pool. Headless runs wait for it here; the TUI starts at once
+    // and installs the result when it arrives (see `run_interactive`).
+    let skill_discovery = {
+        let cwd = cwd.clone();
+        let skills_config = config.skills.clone();
+        tokio::task::spawn_blocking(move || claurst_core::SkillRegistry::discover(&cwd, &skills_config))
+    };
+    let skill_discovery = if is_headless {
+        let registry = skill_discovery.await.context("Skill discovery failed")?;
+        query_config.available_skills = registry.listings();
+        None
+    } else {
+        Some(skill_discovery)
+    };
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -869,6 +879,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
+    query_config.auto_compact = !cli.no_auto_compact;
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
@@ -894,6 +905,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tools
     };
+    // StructuredOutput is offered only with --json-schema. The list was built
+    // above and has no other owner yet.
+    let tools = match structured_output_tool {
+        Some(tool) => {
+            let mut list = Arc::try_unwrap(tools)
+                .map_err(|_| anyhow::anyhow!("the tool list is already shared"))?;
+            list.push(Box::new(tool));
+            Arc::new(list)
+        }
+        None => tools,
+    };
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
@@ -908,7 +930,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --print mode (headless)
     let result = if is_headless {
-        run_headless(
+        let code = run_headless(
             &cli,
             client,
             tools,
@@ -916,7 +938,13 @@ async fn main() -> anyhow::Result<()> {
             query_config,
             cost_tracker,
         )
-        .await
+        .await;
+        cron_cancel.cancel();
+        match code {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(e),
+        }
     } else {
         let auth_store = claurst_core::AuthStore::load();
         let has_saved_credentials = !auth_store.credentials.is_empty()
@@ -933,13 +961,16 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
-            cli.resume,
+            // -c is `--resume` without an id: the most recent session.
+            cli.resume
+                .or_else(|| cli.continue_session.then(|| "__last__".to_string())),
             bridge_config,
             has_credentials,
             model_registry,
             user_question_rx,
             pending_project_mcp,
             mcp_project_root,
+            skill_discovery,
         )
         .await
     };
@@ -948,7 +979,7 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn connect_mcp_manager_arc(
+fn start_mcp_manager(
     servers: &[claurst_core::config::McpServerConfig],
 ) -> Option<Arc<claurst_mcp::McpManager>> {
     if servers.is_empty() {
@@ -956,9 +987,20 @@ async fn connect_mcp_manager_arc(
     }
 
     info!(count = servers.len(), "Connecting to MCP servers");
-    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(servers).await);
-    mcp_manager.clone().spawn_notification_poll_loop();
-    Some(mcp_manager)
+    Some(claurst_mcp::McpManager::start(servers))
+}
+
+/// The session tool list: built-ins, Agent and every connected MCP tool,
+/// narrowed by the active agent's access level.
+fn tools_for_session(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    query_config: &claurst_query::QueryConfig,
+) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+    let tools = build_tools_with_mcp(mcp_manager);
+    match query_config.agent_definition.as_ref() {
+        Some(def) => filter_tools_for_agent(tools, &def.access),
+        None => tools,
+    }
 }
 
 fn build_tools_with_mcp(
@@ -968,14 +1010,7 @@ fn build_tools_with_mcp(
     v.push(Box::new(claurst_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-            let wrapper = McpToolWrapper {
-                tool_def,
-                server_name,
-                manager: manager_arc.clone(),
-            };
-            v.push(Box::new(wrapper));
-        }
+        v.extend(claurst_tools::mcp_tools(manager_arc));
         debug!(total_tools = v.len(), "MCP tools registered");
     }
 
@@ -1378,6 +1413,7 @@ async fn refresh_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1423,6 +1459,7 @@ async fn reload_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1500,9 +1537,7 @@ async fn run_headless(
     tool_ctx: ToolContext,
     query_config: claurst_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
-) -> anyhow::Result<()> {
-    use claurst_query::{QueryEvent, QueryOutcome};
-    use tokio::sync::mpsc;
+) -> anyhow::Result<i32> {
     use tokio_util::sync::CancellationToken;
 
     // Build initial messages list from input.
@@ -1565,7 +1600,7 @@ async fn run_headless(
 
         if prompt.is_empty() {
             eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
-            std::process::exit(1);
+            return Ok(1);
         }
 
         vec![claurst_core::types::Message::user(prompt)]
@@ -1579,165 +1614,94 @@ async fn run_headless(
 
     if messages.is_empty() {
         eprintln!("Error: No messages provided.");
-        std::process::exit(1);
+        return Ok(1);
     }
 
-    let is_json_output = matches!(cli.output_format, CliOutputFormat::Json | CliOutputFormat::StreamJson);
-    let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
+    let started = std::time::Instant::now();
+    let cwd = tool_ctx.working_dir.display().to_string();
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
+    // -c / --resume [id] / --session-id pick the session; the new prompt is
+    // appended to its history and the run is saved like an interactive one.
+    let opened = match headless::session_target(
+        cli.resume.as_deref(),
+        cli.continue_session,
+        cli.session_id_flag.as_deref(),
+        &tool_ctx.session_id,
+    ) {
+        Ok(target) => headless::open_session(target, &query_config.model, &cwd).await,
+        Err(e) => Err(e),
+    };
+    let mut session = match opened {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return Ok(1);
+        }
+    };
+    let mut tool_ctx = tool_ctx;
+    tool_ctx.session_id = session.id.clone();
+    let mut history = std::mem::take(&mut session.messages);
+    history.extend(messages);
+    // A resumed session keeps its model unless --model overrides it, as in
+    // the TUI. (A new session already records the configured model.)
+    let mut query_config = query_config;
+    if cli.model.is_none() && !session.model.is_empty() {
+        query_config.model.clone_from(&session.model);
+    }
+    let model = query_config.model.clone();
+
+    let mut sink = headless::HeadlessSink::new(
+        cli.output_format,
+        session.id.clone(),
+        std::io::stdout(),
+        std::io::stderr(),
+    );
+    sink.init(headless::InitInfo {
+        model: &query_config.model,
+        cwd: &cwd,
+        tools: tools.iter().map(|t| t.name()).collect(),
+        permission_mode: &tool_ctx.permission_mode,
+    })?;
+
+    // Ctrl-C cancels the loop; the run still reports a `cancelled` result
+    // and exits 130.
     let cancel = CancellationToken::new();
-    let client_clone = client.clone();
-    let tool_ctx_clone = tool_ctx.clone();
-    let qcfg = query_config.clone();
-    let tracker_clone = cost_tracker.clone();
-    let event_tx_clone = event_tx.clone();
-    let cancel_clone = cancel.clone();
-
-    let query_handle = tokio::spawn(async move {
-        claurst_query::run_query_loop(
-            client_clone.as_ref(),
-            &mut messages,
-            tools.as_slice(),
-            &tool_ctx_clone,
-            &qcfg,
-            tracker_clone,
-            Some(event_tx_clone),
-            cancel_clone,
-            None,
-        )
-        .await
+    let interrupt = cancel.clone();
+    let ctrl_c = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            interrupt.cancel();
+        }
     });
+    let (outcome, messages) = headless::drive(
+        client,
+        tools,
+        tool_ctx,
+        query_config,
+        cost_tracker.clone(),
+        history,
+        cancel,
+        &mut sink,
+    )
+    .await?;
+    ctrl_c.abort();
 
-    // Drop the original tx so the channel closes when the task drops its clone
-    drop(event_tx);
-
-    // Drain events and print streaming text
-    let mut full_text = String::new();
-
-    while let Some(event) = event_rx.recv().await {
-        match &event {
-            QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
-                delta: claurst_api::streaming::ContentDelta::TextDelta { text },
-                ..
-            }) => {
-                full_text.push_str(text);
-                if !is_json_output {
-                    print!("{}", text);
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                } else if is_stream_json {
-                    let chunk = serde_json::json!({ "type": "text_delta", "text": text });
-                    println!("{}", chunk);
-                }
-            }
-            QueryEvent::ToolStart { tool_name, .. } => {
-                if !is_json_output {
-                    eprintln!("\n[{}...]", tool_name);
-                } else {
-                    let ev = serde_json::json!({ "type": "tool_start", "tool": tool_name });
-                    println!("{}", ev);
-                }
-            }
-            QueryEvent::Error(msg) => {
-                if is_json_output {
-                    let ev = serde_json::json!({ "type": "error", "error": msg });
-                    eprintln!("{}", ev);
-                } else {
-                    eprintln!("\nError: {}", msg);
-                }
-            }
-            _ => {}
-        }
+    let result = sink.result(&outcome, &cost_tracker, started.elapsed());
+    sink.finish(&result)?;
+    // An empty history means the loop task panicked; keep the saved session.
+    if !messages.is_empty() {
+        let compactions = sink.take_compactions();
+        headless::save_session(&mut session, messages, compactions, &model, &cost_tracker).await;
+    }
+    if cli.verbose {
+        eprintln!(
+            "Tokens: {} in / {} out | Cost: ${:.4}",
+            cost_tracker.input_tokens(),
+            cost_tracker.output_tokens(),
+            cost_tracker.total_cost_usd(),
+        );
     }
 
-    // Wait for the query task to finish and get the final outcome
-    let outcome = query_handle.await.unwrap_or(QueryOutcome::Error(
-        claurst_core::error::ClaudeError::Other("Query task panicked".to_string()),
-    ));
-
-    // Final output
-    match cli.output_format {
-        CliOutputFormat::Json => {
-            match outcome {
-                QueryOutcome::EndTurn { message, usage } => {
-                    let result_text = if full_text.is_empty() {
-                        message.get_all_text()
-                    } else {
-                        full_text
-                    };
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "result": result_text,
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                            "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
-        }
-        CliOutputFormat::StreamJson => {
-            // Already streamed above; emit final result event
-            match outcome {
-                QueryOutcome::EndTurn { usage, .. } => {
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
-        }
-        CliOutputFormat::Text => {
-            // Streaming text was already printed; add newline
-            println!();
-            if cli.verbose {
-                eprintln!(
-                    "\nTokens: {} in / {} out | Cost: ${:.4}",
-                    cost_tracker.input_tokens(),
-                    cost_tracker.output_tokens(),
-                    cost_tracker.total_cost_usd(),
-                );
-            }
-            match outcome {
-                QueryOutcome::Error(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-                QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
-                    eprintln!(
-                        "Budget limit ${:.4} reached (spent ${:.4}). Stopping.",
-                        limit_usd, cost_usd
-                    );
-                    std::process::exit(2);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(())
+    Ok(result.subtype.exit_code())
 }
 
 // ---------------------------------------------------------------------------
@@ -1854,6 +1818,17 @@ async fn run_status_line_command(
     }
 }
 
+/// The session's skill listing, once startup discovery has published it.
+/// Returns at once after the first turn. Empty if discovery never reports.
+async fn session_skill_listings(
+    mut listings: tokio::sync::watch::Receiver<Option<Vec<claurst_core::system_prompt::SkillListing>>>,
+) -> Vec<claurst_core::system_prompt::SkillListing> {
+    match listings.wait_for(Option::is_some).await {
+        Ok(published) => published.clone().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
@@ -1870,6 +1845,7 @@ async fn run_interactive(
     user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
+    skill_discovery: Option<tokio::task::JoinHandle<claurst_core::SkillRegistry>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1964,20 +1940,28 @@ async fn run_interactive(
     // state that would otherwise outlive a signalled exit and garble the shell.
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
-    // Discover skill slash commands once at startup so they appear in
-    // autocomplete without re-running discovery per keystroke. Discovery walks
-    // the filesystem and may `git clone` skill URLs, so it runs on the blocking
-    // pool and the main loop installs the result when it arrives.
+    // Startup skill discovery runs on the blocking pool so a cold
+    // `skills.urls` clone never holds the terminal. When it finishes, the
+    // main loop installs the slash commands for autocomplete and every query
+    // task (which waits on `skill_listings` before its first request) gets
+    // the `<available_skills>` listing.
     let (skill_cmds_tx, mut skill_cmds_rx) = mpsc::channel::<Vec<(String, String)>>(1);
+    let (skill_listings_tx, skill_listings) =
+        tokio::sync::watch::channel::<Option<Vec<claurst_core::system_prompt::SkillListing>>>(None);
     {
-        let cwd = tool_ctx.working_dir.clone();
-        let skills_config = live_config.skills.clone();
-        tokio::task::spawn_blocking(move || {
-            let commands = claurst_commands::commands_from_discovered_skills(&cwd, &skills_config)
-                .iter()
-                .map(|c| (c.name().to_string(), c.description().to_string()))
-                .collect();
-            let _ = skill_cmds_tx.blocking_send(commands);
+        let discovery = skill_discovery;
+        tokio::spawn(async move {
+            let registry = match discovery {
+                Some(handle) => handle.await.unwrap_or_else(|e| {
+                    warn!(error = %e, "Skill discovery failed");
+                    claurst_core::SkillRegistry::default()
+                }),
+                None => claurst_core::SkillRegistry::default(),
+            };
+            let _ = skill_cmds_tx
+                .send(claurst_commands::skill_command_entries(&registry))
+                .await;
+            let _ = skill_listings_tx.send(Some(registry.listings()));
         });
     }
     if let Some(error) = settings_load_error {
@@ -2005,7 +1989,6 @@ async fn run_interactive(
     }
     app.provider_registry = base_query_config.provider_registry.clone();
     app.refresh_context_window_size();
-    app.auto_compact_enabled = live_config.auto_compact;
 
     // Background: keep the model registry fresh from models.dev for the whole
     // TUI session (opencode-style: refresh now, then every ~60 min, gated by a
@@ -2214,10 +2197,14 @@ async fn run_interactive(
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
-    let all_tools_arc: Arc<Vec<Box<dyn claurst_tools::Tool>>> =
-        Arc::new(claurst_tools::all_tools());
+    // Agent-mode switches and MCP catalog changes rebuild it via `tools_for_session`.
     let mut tools_arc = tools;
+    // MCP manager generation the current `tools_arc` was built from; `None`
+    // forces a rebuild on the first idle pass.
+    let mut mcp_seen_generation: Option<u64> = None;
+    // Servers whose startup failure was already reported in the status line.
+    let mut mcp_reported_failures: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -2641,6 +2628,20 @@ async fn run_interactive(
                                         removed,
                                         if removed == 1 { "" } else { "s" }
                                     ));
+                                }
+                                Some(CommandResult::Compacted {
+                                    messages: new_msgs,
+                                    record,
+                                    report,
+                                }) => {
+                                    messages = new_msgs.clone();
+                                    app.replace_messages(new_msgs);
+                                    app.context_used_tokens = record.tokens_after;
+                                    session.messages = messages.clone();
+                                    session.compactions.push(record);
+                                    session.updated_at = chrono::Utc::now();
+                                    let _ = claurst_core::history::save_session(&session).await;
+                                    app.status_message = Some(report);
                                 }
                                 Some(CommandResult::OpenRewindOverlay) => {
                                     app.replace_messages(messages.clone());
@@ -3135,7 +3136,6 @@ async fn run_interactive(
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
                         // Session-local /turns override wins over agent and config caps.
                         qcfg.max_turns_override = app.max_turns_override;
-                        qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
@@ -3161,7 +3161,9 @@ async fn run_interactive(
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
 
+                        let skill_listings = skill_listings.clone();
                         let handle = tokio::spawn(async move {
+                            qcfg.available_skills = session_skill_listings(skill_listings).await;
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
                                 client_clone.as_ref(),
@@ -3283,13 +3285,12 @@ async fn run_interactive(
                             if let Some(turns) = def.max_turns {
                                 base_query_config.max_turns = turns;
                             }
-                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
                         } else {
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
                             base_query_config.agent_definition = None;
-                            tools_arc = all_tools_arc.clone();
                         }
+                        tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
@@ -3382,6 +3383,10 @@ async fn run_interactive(
 
         // Drain query events — also forward relevant ones to the bridge as outbound.
         while let Ok(evt) = event_rx.try_recv() {
+            // Record loop compactions in the session (issue #441).
+            if let QueryEvent::Compacted(record) = &evt {
+                session.compactions.push(record.clone());
+            }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
@@ -3457,72 +3462,6 @@ async fn run_interactive(
                 }
             }
             app.handle_query_event(evt);
-        }
-
-        // Auto-compact: when context usage hits 99% and no query is running,
-        // automatically submit a compact request.
-        if app.context_window_size > 0
-            && !app.is_streaming
-            && current_query.is_none()
-            && !app.auto_compact_running
-        {
-            let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
-            if used_pct >= 99 {
-                app.auto_compact_running = true;
-                let msg_count = messages.len();
-                let compact_msg = format!(
-                    "[Auto-compact triggered ({} messages, {}% context used). \
-                     Provide a detailed summary of our conversation so far, \
-                     preserving all key technical details, decisions made, \
-                     file paths mentioned, and current task status.]",
-                    msg_count, used_pct
-                );
-                app.status_message = Some("Context 99% full — auto-compacting…".to_string());
-                let user_msg = claurst_core::types::Message::user(compact_msg);
-                messages.push(user_msg.clone());
-                app.push_message(user_msg);
-                session.messages = messages.clone();
-                session.updated_at = chrono::Utc::now();
-
-                // Dispatch the compact query immediately.
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
-                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
-                let msgs_arc_clone = msgs_arc.clone();
-                let tools_arc_clone = tools_arc.clone();
-                let ctx_clone = tool_ctx.clone();
-                let mut qcfg = base_query_config.clone();
-                qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                // Session-local /turns override wins over agent and config caps.
-                qcfg.max_turns_override = app.max_turns_override;
-                // Auto-compact is a maintenance turn, not a goal turn: never let
-                // it trigger in-loop goal continuation.
-                qcfg.continuation = claurst_query::ContinuationMode::Default;
-                let tracker = cost_tracker.clone();
-                let tx = event_tx.clone();
-                let client_clone = client.clone();
-                app.is_streaming = true;
-
-                let handle = tokio::spawn(async move {
-                    let mut msgs = msgs_arc_clone.lock().await.clone();
-                    let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
-                        &mut msgs,
-                        tools_arc_clone.as_slice(),
-                        &ctx_clone,
-                        &qcfg,
-                        tracker,
-                        Some(tx),
-                        ct,
-                        None,
-                    )
-                    .await;
-                    *msgs_arc_clone.lock().await = msgs;
-                    outcome
-                });
-                current_query = Some((handle, msgs_arc));
-            }
         }
 
         // Drain TUI-facing bridge events.
@@ -3657,7 +3596,9 @@ async fn run_interactive(
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
+                        let skill_listings = skill_listings.clone();
                         let handle = tokio::spawn(async move {
+                            qcfg.available_skills = session_skill_listings(skill_listings).await;
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
                                 client_clone.as_ref(),
@@ -3767,7 +3708,9 @@ async fn run_interactive(
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
+                let skill_listings = skill_listings.clone();
                 let handle = tokio::spawn(async move {
+                    qcfg.available_skills = session_skill_listings(skill_listings).await;
                     let mut msgs = msgs_arc_clone.lock().await.clone();
                     let outcome = claurst_query::run_query_loop(
                         client_clone.as_ref(),
@@ -4031,7 +3974,7 @@ async fn run_interactive(
             app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
         }
 
-        // Install skill slash commands once background discovery finishes.
+        // Install skill slash commands once startup discovery finishes.
         if let Ok(commands) = skill_cmds_rx.try_recv() {
             app.set_discovered_slash_commands(commands);
         }
@@ -4215,6 +4158,7 @@ async fn run_interactive(
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
                 let result = handle.await;
+                let aborted = matches!(result, Ok(QueryOutcome::Cancelled));
                 app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
                 if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
@@ -4228,6 +4172,12 @@ async fn run_interactive(
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
+                // Tell the next turn that this one was interrupted on purpose.
+                if aborted {
+                    messages.push(claurst_core::types::Message::user(
+                        claurst_core::system_prompt::TURN_ABORTED_MESSAGE,
+                    ));
+                }
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
@@ -4240,12 +4190,6 @@ async fn run_interactive(
                     app.prompt_input.text = next;
                     app.prompt_input.cursor = app.prompt_input.text.len();
                     app.pending_auto_submit = true;
-                }
-                if app.auto_compact_running {
-                    app.auto_compact_running = false;
-                    // After auto-compact the context was summarised — reset usage.
-                    app.context_used_tokens = 0;
-                    app.status_message = Some("Auto-compact complete.".to_string());
                 }
 
                 // Save session to JSONL (primary storage)
@@ -4393,27 +4337,53 @@ async fn run_interactive(
                 &app.mcp_session_trusted,
                 &store,
             );
-            let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
+            let new_mcp_manager = start_mcp_manager(&decision.allowed);
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            // Read the generation before building: a connect task that bumps
+            // it in between then still triggers a rebuild in the idle block.
+            mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
+            tools_arc = tools_for_session(new_mcp_manager.clone(), &base_query_config);
+            mcp_reported_failures.clear();
             if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
 
-            let connected = new_mcp_manager
-                .as_ref()
-                .map(|manager| manager.server_count())
-                .unwrap_or(0);
             app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
+                let starting = decision.allowed.len();
                 format!(
-                    "Reconnected MCP runtime ({} connected server{}).",
-                    connected,
-                    if connected == 1 { "" } else { "s" }
+                    "Reconnecting MCP runtime ({} server{})...",
+                    starting,
+                    if starting == 1 { "" } else { "s" }
                 )
             });
+        }
+
+        // MCP servers connect in the background and may change their tool
+        // lists at runtime (`tools/list_changed`). Rebuild the tool list
+        // between turns whenever the manager reports a change, and surface
+        // servers that failed to start.
+        if !app.is_streaming && current_query.is_none() {
+            if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                let generation = manager.generation();
+                if mcp_seen_generation != Some(generation) {
+                    mcp_seen_generation = Some(generation);
+                    tools_arc = tools_for_session(Some(manager.clone()), &base_query_config);
+                    if app.mcp_view.visible {
+                        app.refresh_mcp_view();
+                    }
+                    for (server, error) in manager.failed_servers() {
+                        if mcp_reported_failures.insert(server.clone()) {
+                            app.status_message = Some(format!(
+                                "MCP server '{}' failed to start: {} (see /mcp)",
+                                server, error
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Prompt for any project-defined MCP servers awaiting approval (#123).

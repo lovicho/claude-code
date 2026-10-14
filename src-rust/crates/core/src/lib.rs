@@ -49,7 +49,7 @@ pub use spinner::{SPINNER_VERBS, TURN_COMPLETION_VERBS, sample_spinner_verb, sam
 pub mod remote_session;
 pub mod cloud_session;
 
-// AGENTS.md hierarchical memory loading (T4-1).
+// AGENTS.md / CLAUDE.md instruction files for the system prompt.
 pub mod claudemd;
 
 // Message manipulation utilities (T4-2).
@@ -94,7 +94,10 @@ pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, Imp
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
-pub use skill_discovery::{DiscoveredSkill, discover_skills, parse_skill_file};
+pub use skill_discovery::{DiscoveredSkill, RegisteredSkill, SkillRegistry, discover_skills, parse_skill_file};
+
+// Skills compiled into the binary; one source of the skill registry.
+pub mod bundled_skills;
 pub use cost::CostTracker;
 pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;
@@ -121,7 +124,12 @@ pub mod error {
         Api(String),
 
         #[error("API error {status}: {message}")]
-        ApiStatus { status: u16, message: String },
+        ApiStatus {
+            status: u16,
+            message: String,
+            /// Server-requested wait (`retry-after-ms` / `Retry-After`), if any.
+            retry_after: Option<std::time::Duration>,
+        },
 
         #[error("Authentication error: {0}")]
         Auth(String),
@@ -167,16 +175,6 @@ pub mod error {
     pub type Result<T> = std::result::Result<T, ClaudeError>;
 
     impl ClaudeError {
-        /// Return `true` when the caller should retry the request.
-        pub fn is_retryable(&self) -> bool {
-            matches!(
-                self,
-                ClaudeError::RateLimit
-                    | ClaudeError::ApiStatus { status: 429, .. }
-                    | ClaudeError::ApiStatus { status: 529, .. }
-            )
-        }
-
         /// Return `true` for errors that mean the conversation cannot continue
         /// without intervention (e.g. compaction or context-window reset).
         pub fn is_context_limit(&self) -> bool {
@@ -1120,6 +1118,16 @@ pub mod config {
             skip_serializing_if = "Option::is_none"
         )]
         pub request_timeout_secs: Option<u64>,
+        /// Retries allowed after a model request fails transiently (HTTP
+        /// 408/409/425/429/5xx, dropped connections, truncated streams).
+        /// `None` uses the default of 5; `0` disables retrying.
+        #[serde(
+            default,
+            rename = "maxRetries",
+            alias = "max_retries",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_retries: Option<u32>,
         /// Whether app-level mouse capture is enabled. `None` (default) or
         /// `Some(true)` means claurst captures the mouse for scroll / right-click
         /// context menu / middle-click paste / drag text-selection. Set
@@ -1299,6 +1307,19 @@ pub mod config {
         pub url: Option<String>,
         #[serde(rename = "type", default = "default_mcp_type")]
         pub server_type: String,
+        /// Extra HTTP headers sent with every request to an `http`/`sse`
+        /// server. Values support `${VAR}` expansion. An `Authorization`
+        /// header here replaces the stored OAuth token.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub headers: HashMap<String, String>,
+        /// Bound on spawning/opening the transport and the `initialize`
+        /// handshake, in milliseconds. `None` uses the 10 s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub connect_timeout_ms: Option<u64>,
+        /// Bound on each catalog request (`tools/list`, `resources/list`,
+        /// `prompts/list`), in milliseconds. `None` uses the 30 s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub catalog_timeout_ms: Option<u64>,
         /// Origin of this definition. Never read from JSON (always `User` on
         /// deserialize); set to `Project` in `find_project_settings` for
         /// servers loaded from a repo. See [`McpServerOrigin`].
@@ -1321,6 +1342,11 @@ pub mod config {
         /// Git repository URLs to fetch skills from (cloned once, then cached).
         #[serde(default)]
         pub urls: Vec<String>,
+        /// Skip the project skill directories (`.claurst/skills`,
+        /// `.agents/skills`, `.claude/skills` from cwd to the git root).
+        /// Set at runtime by `--bare`; never read from settings files.
+        #[serde(skip)]
+        pub skip_project_dirs: bool,
     }
 
     // ---- Settings --------------------------------------------------------
@@ -2141,7 +2167,7 @@ pub mod config {
                 skills: {
                     let mut paths = base.config.skills.paths;
                     for p in over.config.skills.paths { if !paths.contains(&p) { paths.push(p); } }
-                    SkillsConfig { paths, urls: base.config.skills.urls }
+                    SkillsConfig { paths, urls: base.config.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
@@ -2156,6 +2182,7 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                max_retries: over.config.max_retries.or(base.config.max_retries),
                 // SECURITY: only the user's global settings may define a status_line
                 // command. A project's settings file must NOT be able to inject an
                 // arbitrary shell command — otherwise cloning a malicious repo would
@@ -2194,7 +2221,7 @@ pub mod config {
                 skills: {
                     let mut paths = base.skills.paths;
                     for p in over.skills.paths { if !paths.contains(&p) { paths.push(p); } }
-                    SkillsConfig { paths, urls: base.skills.urls }
+                    SkillsConfig { paths, urls: base.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
                 auto_copy_on_highlight: over.auto_copy_on_highlight || base.auto_copy_on_highlight,
@@ -2688,7 +2715,9 @@ pub mod constants {
     pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
     pub const MAX_TOKENS_HARD_LIMIT: u32 = 65_536;
     pub const DEFAULT_COMPACT_THRESHOLD: f32 = 0.9;
-    pub const MAX_TURNS_DEFAULT: u32 = 10;
+    /// Default turn cap (`--max-turns`). High enough that real agentic tasks
+    /// finish; it guards against runaway loops, not normal work (#473).
+    pub const MAX_TURNS_DEFAULT: u32 = 100;
     pub const MAX_TOOL_ERRORS: u32 = 3;
 
     // API endpoints & headers
@@ -2700,7 +2729,6 @@ pub mod constants {
          effort-2025-11-24";
 
     // File system
-    pub const CLAUDE_MD_FILENAME: &str = "AGENTS.md";
     pub const SETTINGS_FILENAME: &str = "settings.json";
     pub const HISTORY_FILENAME: &str = "conversations";
     pub const CONFIG_DIR_NAME: &str = ".claurst";
@@ -2754,32 +2782,18 @@ pub mod context {
     /// every conversation with the model.
     pub struct ContextBuilder {
         cwd: PathBuf,
-        disable_claude_mds: bool,
     }
 
     impl ContextBuilder {
         pub fn new(cwd: PathBuf) -> Self {
-            Self {
-                cwd,
-                disable_claude_mds: false,
-            }
+            Self { cwd }
         }
 
-        pub fn disable_claude_mds(mut self, val: bool) -> Self {
-            self.disable_claude_mds = val;
-            self
-        }
-
-        /// System context (git status, platform, IDE, etc.)
+        /// System context (git status, IDE). Changes between sessions, so it
+        /// belongs in the dynamic system block. Date, platform and working
+        /// directory are in the prompt's `<environment_context>`.
         pub async fn build_system_context(&self) -> String {
             let mut parts = vec![];
-
-            // Platform information
-            parts.push(format!("Platform: {}", std::env::consts::OS));
-            parts.push(format!(
-                "Working directory: {}",
-                self.cwd.display()
-            ));
 
             if let Some(git_context) = self.get_git_context().await {
                 parts.push(git_context);
@@ -2789,24 +2803,6 @@ pub mod context {
             // Mirrors TS getContextAttachments() → IdeContext attachment.
             if let Some(ide_ctx) = crate::attachments::get_ide_context() {
                 parts.push(format!("# IDE Context\n{}", ide_ctx));
-            }
-
-            parts.join("\n\n")
-        }
-
-        /// User context (date, AGENTS.md memories, etc.)
-        pub async fn build_user_context(&self) -> String {
-            let mut parts = vec![];
-
-            let date = chrono::Local::now()
-                .format("%A, %B %d, %Y")
-                .to_string();
-            parts.push(format!("Today's date is {}.", date));
-
-            if !self.disable_claude_mds {
-                if let Some(claude_md) = self.find_and_read_claude_md().await {
-                    parts.push(claude_md);
-                }
             }
 
             parts.join("\n\n")
@@ -2842,52 +2838,6 @@ pub mod context {
             }
 
             Some(result)
-        }
-
-        /// Walk up from cwd looking for AGENTS.md files and the global one.
-        async fn find_and_read_claude_md(&self) -> Option<String> {
-            let mut claude_mds = vec![];
-
-            // Global <claurst home>/AGENTS.md
-            {
-                let global_claude_md = crate::config::Settings::config_dir()
-                    .join(crate::constants::CLAUDE_MD_FILENAME);
-                if global_claude_md.exists() {
-                    if let Ok(content) = tokio::fs::read_to_string(&global_claude_md).await {
-                        claude_mds.push(format!(
-                            "# Memory (from {})\n{}",
-                            global_claude_md.display(),
-                            content
-                        ));
-                    }
-                }
-            }
-
-            // Walk from cwd up to filesystem root, collecting AGENTS.md
-            let mut dir = Some(self.cwd.as_path());
-            let mut project_mds: Vec<String> = vec![];
-            while let Some(d) = dir {
-                let candidate = d.join(crate::constants::CLAUDE_MD_FILENAME);
-                if candidate.exists() {
-                    if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
-                        project_mds.push(format!(
-                            "# Project Memory (from {})\n{}",
-                            candidate.display(),
-                            content
-                        ));
-                    }
-                }
-                dir = d.parent();
-            }
-            // Reverse so outermost directory comes first
-            project_mds.reverse();
-            claude_mds.extend(project_mds);
-
-            if claude_mds.is_empty() {
-                None
-            } else {
-                Some(claude_mds.join("\n\n"))
-            }
         }
     }
 }
@@ -2954,8 +2904,10 @@ pub mod permissions {
     /// A single permission rule.
     ///
     /// Matches requests where:
-    ///   - `tool_name` is `None` (applies to every tool) OR equals the
-    ///     request tool name.
+    ///   - `tool_name` is `None` (applies to every tool), equals the request
+    ///     tool name, or is a server-wide MCP rule (`mcp__<server>` or
+    ///     `mcp__<server>__*`) and the request is one of that server's
+    ///     `mcp__<server>__<tool>` tools.
     ///   - `path_pattern` is `None` OR the glob pattern matches the
     ///     request path.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2974,7 +2926,7 @@ pub mod permissions {
         pub fn matches(&self, tool_name: &str, path: Option<&str>) -> bool {
             // Tool name check
             if let Some(ref rule_tool) = self.tool_name {
-                if rule_tool != tool_name {
+                if rule_tool != tool_name && !mcp_server_rule_matches(rule_tool, tool_name) {
                     return false;
                 }
             }
@@ -2994,6 +2946,24 @@ pub mod permissions {
             }
             true
         }
+    }
+
+    /// `true` when `rule_tool` is a server-wide MCP rule (`mcp__<server>` or
+    /// `mcp__<server>__*`) and `tool_name` is one of that server's exposed
+    /// `mcp__<server>__<tool>` names. `<server>` is the sanitized server name
+    /// as it appears in the exposed tool names.
+    fn mcp_server_rule_matches(rule_tool: &str, tool_name: &str) -> bool {
+        let Some(rule_server) = rule_tool.strip_prefix("mcp__") else {
+            return false;
+        };
+        let rule_server = rule_server.strip_suffix("__*").unwrap_or(rule_server);
+        if rule_server.is_empty() || rule_server.contains("__") {
+            return false;
+        }
+        tool_name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.strip_prefix(rule_server))
+            .is_some_and(|rest| rest.starts_with("__") && rest.len() > 2)
     }
 
     /// The canonical form of an absolute glob whose literal directory prefix
@@ -3548,8 +3518,9 @@ pub mod permissions {
 
     /// Non-interactive handler backed by a shared `PermissionManager`.
     ///
-    /// Delegates to `PermissionManager::evaluate`; converts `Ask` decisions
-    /// into `Deny` (no interactive prompt available in headless mode).
+    /// Delegates to `PermissionManager::evaluate` and passes `Ask` through:
+    /// a non-interactive `ToolContext` turns it into a rejection that tells
+    /// the model why, instead of a bare deny (#473).
     pub struct ManagedAutoPermissionHandler {
         pub manager: Arc<Mutex<PermissionManager>>,
     }
@@ -3563,17 +3534,13 @@ pub mod permissions {
     impl PermissionHandler for ManagedAutoPermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                let decision = m.evaluate(
+                return m.evaluate(
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
                 );
-                return match decision {
-                    PermissionDecision::Ask { .. } => PermissionDecision::Deny,
-                    other => other,
-                };
             }
             PermissionDecision::Deny
         }
@@ -3737,6 +3704,29 @@ pub mod permissions {
                 scope: PermissionScope::Session,
             });
             assert_eq!(m.evaluate("Bash", "echo hi", None, None, &[]), PermissionDecision::Deny);
+        }
+
+        #[test]
+        fn mcp_server_wide_rules_match_that_servers_tools_only() {
+            let rule = |tool: &str| PermissionRule {
+                tool_name: Some(tool.to_string()),
+                path_pattern: None,
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            };
+            for server_rule in ["mcp__git", "mcp__git__*"] {
+                let r = rule(server_rule);
+                assert!(r.matches("mcp__git__status", None), "{server_rule}");
+                assert!(r.matches("mcp__git__lab_status", None), "{server_rule}");
+                assert!(!r.matches("mcp__git_lab__status", None), "{server_rule}");
+                assert!(!r.matches("mcp__git__", None), "{server_rule}");
+                assert!(!r.matches("git_status", None), "{server_rule}");
+                assert!(!r.matches("Bash", None), "{server_rule}");
+            }
+            // An exact tool rule still matches only that tool.
+            let exact = rule("mcp__git__status");
+            assert!(exact.matches("mcp__git__status", None));
+            assert!(!exact.matches("mcp__git__diff", None));
         }
 
         #[test]
@@ -3906,6 +3896,37 @@ pub mod history {
         pub snapshot: Vec<Message>,
     }
 
+    /// What started a compaction of the session history.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CompactionTrigger {
+        /// The projected context crossed the auto-compact threshold.
+        Threshold,
+        /// The provider rejected a request for exceeding the context window.
+        Overflow,
+        /// The user ran `/compact`.
+        Manual,
+    }
+
+    /// One compaction of the session history (issue #441). The head of the
+    /// history was replaced by the summary message whose uuid is
+    /// `summary_uuid`; this entry records when, why and how much it saved.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct CompactionRecord {
+        pub at: chrono::DateTime<chrono::Utc>,
+        pub trigger: CompactionTrigger,
+        /// uuid of the summary message now at the head of the history.
+        pub summary_uuid: String,
+        pub messages_before: usize,
+        pub messages_after: usize,
+        /// Estimated context tokens before and after (chars / 4 heuristic).
+        pub tokens_before: u64,
+        pub tokens_after: u64,
+        /// `false` when the summariser failed and the head was dropped to
+        /// recover from a context-window error, keeping only the untouched tail.
+        pub summarised: bool,
+    }
+
     /// A single persisted conversation session.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ConversationSession {
@@ -3943,6 +3964,9 @@ pub mod history {
         /// Message index in the parent session at which this fork was created.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fork_point_message_index: Option<usize>,
+        /// Compactions applied to `messages`, oldest first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub compactions: Vec<CompactionRecord>,
     }
 
     impl ConversationSession {
@@ -3965,6 +3989,7 @@ pub mod history {
                 checkpoints: vec![],
                 parent_session_id: None,
                 fork_point_message_index: None,
+                compactions: vec![],
             }
         }
 
@@ -4146,6 +4171,7 @@ pub mod history {
             checkpoints: vec![],
             parent_session_id: None,
             fork_point_message_index: None,
+            compactions: vec![],
         };
         save_session(&branched).await?;
         Ok(branched)
@@ -4881,6 +4907,10 @@ pub mod paths;
 // tasks module — background task registry
 // ---------------------------------------------------------------------------
 pub mod tasks {
+    use crate::truncate::{
+        bound_head_tail, head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES,
+        OUTPUT_WINDOW_LINES,
+    };
     use chrono::{DateTime, Utc};
     use dashmap::DashMap;
     use once_cell::sync::Lazy;
@@ -4922,8 +4952,17 @@ pub mod tasks {
         pub started_at: DateTime<Utc>,
         /// When the task finished (completed, failed, or cancelled).
         pub completed_at: Option<DateTime<Utc>>,
-        /// Lines of output produced by the task.
+        /// Lines of output produced by the task: the first
+        /// [`OUTPUT_WINDOW_LINES`] lines followed by a rolling tail. Lines
+        /// dropped in between are counted in `omitted_output_lines` (#442).
         pub output: Vec<String>,
+        /// Lines dropped from the middle of `output` to keep memory bounded.
+        #[serde(default)]
+        pub omitted_output_lines: u64,
+        /// File holding the task's full output when it outgrew the in-memory
+        /// windows (#442).
+        #[serde(default)]
+        pub output_file: Option<std::path::PathBuf>,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
         /// Cancellation token for the task's in-process work loop. Signalling it
@@ -4943,9 +4982,39 @@ pub mod tasks {
                 started_at: Utc::now(),
                 completed_at: None,
                 output: Vec::new(),
+                omitted_output_lines: 0,
+                output_file: None,
                 pid: None,
                 cancel_token: None,
             }
+        }
+
+        /// Total lines the task has produced, including omitted ones.
+        pub fn output_line_count(&self) -> u64 {
+            self.output.len() as u64 + self.omitted_output_lines
+        }
+
+        /// The task's output bounded for the model: a head window and a tail
+        /// window (lines and bytes) around a note naming what was left out,
+        /// plus `Full output: <path>` once the full output was spilled (#442).
+        pub fn render_output(&self) -> String {
+            let mut text = if self.omitted_output_lines == 0 {
+                let text = self.output.join("\n");
+                bound_head_tail(&text).unwrap_or(text)
+            } else {
+                let split = OUTPUT_WINDOW_LINES.min(self.output.len());
+                let head = self.output[..split].join("\n");
+                let tail = self.output[split..].join("\n");
+                join_head_tail(
+                    head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                    tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                    &format!("{} lines", self.omitted_output_lines),
+                )
+            };
+            if let Some(path) = &self.output_file {
+                text.push_str(&format!("\n\nFull output: {}", path.display()));
+            }
+            text
         }
 
         /// Return `true` if the task is still running.
@@ -4986,9 +5055,18 @@ pub mod tasks {
         }
 
         /// Append a line of output to an existing task.  No-op if unknown.
+        ///
+        /// Memory stays bounded (#442): the first [`OUTPUT_WINDOW_LINES`] lines
+        /// are kept, and once the buffer holds two further tail windows the
+        /// middle is dropped back down to one (amortised O(1) per line).
         pub fn append_output(&self, id: &str, line: &str) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
                 entry.output.push(line.to_string());
+                if entry.output.len() > 3 * OUTPUT_WINDOW_LINES {
+                    let end = entry.output.len() - OUTPUT_WINDOW_LINES;
+                    entry.output.drain(OUTPUT_WINDOW_LINES..end);
+                    entry.omitted_output_lines += (end - OUTPUT_WINDOW_LINES) as u64;
+                }
             }
         }
 
@@ -5032,6 +5110,13 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Cancelled);
         }
 
+        /// Record the file holding a task's full output.  No-op if unknown.
+        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                entry.output_file = Some(path);
+            }
+        }
+
         /// Set the OS process ID for a task.  No-op if unknown.
         pub fn set_pid(&self, id: &str, pid: u32) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
@@ -5052,6 +5137,46 @@ pub mod tasks {
     /// Return a reference to the process-global `TaskRegistry`.
     pub fn global_registry() -> &'static TaskRegistry {
         &GLOBAL_REGISTRY
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// #442: a chatty background task keeps a head window plus a rolling
+        /// tail instead of every line, and renders a bounded result.
+        #[test]
+        fn task_output_is_bounded_head_plus_tail() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("chatty"));
+            for i in 0..100_000 {
+                registry.append_output(&id, &format!("line {i}"));
+            }
+            let task = registry.get(&id).unwrap();
+            assert!(task.output.len() <= 3 * OUTPUT_WINDOW_LINES);
+            assert_eq!(task.output_line_count(), 100_000);
+            assert_eq!(task.output[0], "line 0");
+            assert_eq!(task.output.last().unwrap(), "line 99999");
+
+            let rendered = task.render_output();
+            assert!(rendered.starts_with("line 0\n"));
+            assert!(rendered.ends_with("line 99999"));
+            assert!(rendered.contains("lines omitted"));
+            assert!(rendered.len() <= 2 * OUTPUT_WINDOW_BYTES + 100);
+
+            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"));
+            let rendered = registry.get(&id).unwrap().render_output();
+            assert!(rendered.ends_with("line 99999\n\nFull output: /spill/x.txt"));
+        }
+
+        #[test]
+        fn small_task_output_renders_whole() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("quiet"));
+            registry.append_output(&id, "a");
+            registry.append_output(&id, "b");
+            assert_eq!(registry.get(&id).unwrap().render_output(), "a\nb");
+        }
     }
 }
 
@@ -5130,6 +5255,9 @@ mod tests {
             env: std::collections::HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: McpServerOrigin::User,
         });
         let json = serde_json::to_string_pretty(&project).unwrap();
@@ -5160,17 +5288,6 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 1000);
         assert_eq!(tracker.output_tokens(), 500);
         assert!(tracker.total_cost_usd() > 0.0);
-    }
-
-    #[test]
-    fn test_error_retryable() {
-        assert!(ClaudeError::RateLimit.is_retryable());
-        assert!(ClaudeError::ApiStatus {
-            status: 429,
-            message: "rate limited".into()
-        }
-        .is_retryable());
-        assert!(!ClaudeError::Auth("bad key".into()).is_retryable());
     }
 
     // ---- Config tests -------------------------------------------------------

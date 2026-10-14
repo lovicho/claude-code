@@ -2459,8 +2459,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let mut spans: Vec<Span> = Vec::new();
 
+        // Retry pill (#439): a model request is being retried.
+        if let Some((attempt, max)) = app.retry_status {
+            spans.push(Span::styled(
+                format!("\u{27f3} Reconnecting {}/{}", attempt, max),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // Agent type badge (shown when running as subagent / coordinator)
         if let Some(ref badge) = app.agent_type_badge {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
             spans.push(Span::styled(
                 format!("\u{2699} {}", badge),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -2643,6 +2654,25 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
+        // 2. Prompt-cache tokens for the session (Anthropic reports these as
+        //    `cache_read_input_tokens` / `cache_creation_input_tokens`; reads
+        //    are already priced at the discounted rate by the cost tracker).
+        let cache_read = app.cost_tracker.cache_read_tokens();
+        let cache_write = app.cost_tracker.cache_creation_tokens();
+        if cache_read > 0 || cache_write > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!(
+                    "cache {} read \u{00b7} {} write",
+                    claurst_core::format_utils::format_tokens(cache_read),
+                    claurst_core::format_utils::format_tokens(cache_write),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
         // Display cost if it's >= 0.0, so free models show $0.00
         if app.cost_usd >= 0.0 {
@@ -2810,6 +2840,26 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 "MCP reconnecting",
                 Style::default().fg(Color::Yellow),
             ));
+        } else if let Some(manager) = app.mcp_manager.as_ref() {
+            // Servers connect in the background: show progress, then failures.
+            let summary = manager.status_summary();
+            if summary.connecting > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP connecting ({})", summary.connecting),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if summary.failed > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP {} failed", summary.failed),
+                    Style::default().fg(Color::Red),
+                ));
+            }
         }
 
         parts
@@ -4109,11 +4159,51 @@ mod status_line_tests {
     }
 
     #[test]
+    fn footer_shows_prompt_cache_tokens() {
+        let app = App::new(Config::default(), CostTracker::new());
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("cache "));
+
+        app.cost_tracker.add_usage(12, 40, 3_400, 51_000);
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(
+            rows(&terminal)[0].contains("cache 51K read \u{00b7} 3.4K write"),
+            "footer: {:?}",
+            rows(&terminal)[0]
+        );
+    }
+
+    #[test]
     fn status_line_renders_above_footer_in_full_layout() {
         let mut app = app_with_status_line(None, None);
         app.set_status_line_output("ext-status-ok");
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render_app(f, &app)).unwrap();
         assert!(rows(&terminal).iter().any(|r| r.contains("ext-status-ok")));
+    }
+
+    #[test]
+    fn footer_shows_reconnecting_pill_during_retry() {
+        let mut app = app_with_status_line(None, None);
+        app.streaming_text = "partial output".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::Retry {
+            attempt: 2,
+            max_attempts: 5,
+            delay_ms: 1500,
+            reason: "Server error 503".to_string(),
+        });
+        assert_eq!(app.retry_status, Some((2, 5)));
+        assert!(app.streaming_text.is_empty(), "failed attempt output is dropped");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(rows(&terminal).iter().any(|r| r.contains("Reconnecting 2/5")));
+
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert!(app.retry_status.is_none(), "a completed turn clears the pill");
     }
 }

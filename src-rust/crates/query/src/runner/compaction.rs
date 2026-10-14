@@ -2,6 +2,7 @@
 // threshold check and compact-and-retry after a context-window error.
 
 use crate::*;
+use claurst_core::session_journal::SessionJournal;
 
 /// Wrap the loop's Anthropic client as an [`claurst_api::LlmProvider`] so the
 /// raw-client branch summarises through the same provider-agnostic path as
@@ -51,7 +52,8 @@ pub(crate) fn claude_error_is_overflow(err: &ClaudeError) -> bool {
 }
 
 /// Pre-request check point: compact when the projected context crosses the
-/// threshold. Returns `true` when the history was replaced.
+/// threshold. Returns `true` when the history was replaced. PreCompact hooks
+/// run before a compaction starts.
 ///
 /// With the `reactive_compact` feature gate the 90 % / 97 % reactive
 /// compact / context-collapse ladder runs instead of the proactive path.
@@ -64,8 +66,10 @@ pub(crate) async fn compact_before_request(
     context_window: u64,
     max_output_tokens: u32,
     state: &mut compact::AutoCompactState,
+    journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
     cancel_token: &tokio_util::sync::CancellationToken,
+    tool_ctx: &ToolContext,
 ) -> bool {
     let send_status = |text: &str| {
         if let Some(tx) = event_tx {
@@ -81,6 +85,7 @@ pub(crate) async fn compact_before_request(
         let Some((provider, model)) = compaction_endpoint(route, client, effective_model) else {
             return false;
         };
+        pre_compact(tool_ctx).await;
         // Pass a clone so the live conversation survives a failed
         // compaction; `*messages` is only overwritten on success (#213).
         let outcome = if collapse {
@@ -120,6 +125,7 @@ pub(crate) async fn compact_before_request(
     let Some((provider, model)) = compaction_endpoint(route, client, effective_model) else {
         return false;
     };
+    pre_compact(tool_ctx).await;
     send_status("Compacting context...");
     match compact::auto_compact_if_needed(
         provider.as_ref(),
@@ -133,7 +139,7 @@ pub(crate) async fn compact_before_request(
     .await
     {
         Some(compaction) => {
-            apply_compaction(messages, compaction, event_tx);
+            apply_compaction(messages, compaction, journal, event_tx);
             true
         }
         None => false,
@@ -142,14 +148,17 @@ pub(crate) async fn compact_before_request(
 
 /// Overflow recovery: the provider rejected the request for exceeding the
 /// context window, so compact once before the caller retries. Returns `true`
-/// when the history was compacted.
+/// when the history was compacted. PreCompact hooks run first.
 pub(crate) async fn compact_after_overflow(
     messages: &mut Vec<Message>,
     provider: &dyn claurst_api::LlmProvider,
     model: &str,
     max_output_tokens: u32,
+    journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+    tool_ctx: &ToolContext,
 ) -> bool {
+    pre_compact(tool_ctx).await;
     if let Some(tx) = event_tx {
         let _ = tx.send(QueryEvent::Status(
             "Context window exceeded — compacting and retrying…".to_string(),
@@ -171,7 +180,7 @@ pub(crate) async fn compact_after_overflow(
                 after = compaction.messages.len(),
                 "Compacted after a context-window error; retrying the request"
             );
-            apply_compaction(messages, compaction, event_tx);
+            apply_compaction(messages, compaction, journal, event_tx);
             true
         }
         Ok(None) => {
@@ -185,17 +194,24 @@ pub(crate) async fn compact_after_overflow(
     }
 }
 
-/// Replace the history with a compaction's result and report it: a status
-/// line with the token counts and a [`QueryEvent::Compacted`] entry for the
-/// caller to record in the session.
+/// Replace the history with a compaction's result, keeping the replaced head
+/// in the record and the session journal (issue #449), and report it: a
+/// status line with the token counts and a [`QueryEvent::Compacted`] entry
+/// for the caller to record in the session.
 fn apply_compaction(
     messages: &mut Vec<Message>,
     compaction: compact::Compaction,
+    journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
 ) {
-    *messages = compaction.messages;
+    let compact::Compaction { messages: compacted, mut record } = compaction;
+    claurst_core::history::apply_compaction(messages, compacted, &mut record);
+    if let Some(journal) = journal {
+        if let Err(e) = journal.record_compaction(&record, messages) {
+            warn!(error = %e, "Session journal: compaction not recorded");
+        }
+    }
     if let Some(tx) = event_tx {
-        let record = compaction.record;
         let verb = if record.summarised {
             "Context compacted"
         } else {

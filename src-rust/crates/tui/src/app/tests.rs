@@ -750,108 +750,6 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert_eq!(app.prompt_input.text, "hello");
     }
 
-    // ---- Bash prefix allowlist ----------------------------------------------
-
-    #[test]
-    fn test_bash_command_not_allowed_by_default() {
-        let app = make_app();
-        assert!(!app.bash_command_allowed_by_prefix("git status"));
-        assert!(!app.bash_command_allowed_by_prefix("ls -la"));
-        assert!(!app.bash_command_allowed_by_prefix(""));
-    }
-
-    #[test]
-    fn test_bash_prefix_allowlist_after_p_key() {
-        use crate::dialogs::PermissionRequest;
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-        let mut app = make_app();
-        // Set up a bash permission dialog with a suggested prefix.
-        let pr = PermissionRequest::bash(
-            "tu-1".to_string(),
-            "Bash".to_string(),
-            "This will execute a shell command.".to_string(),
-            "git status".to_string(),
-            Some("git".to_string()),
-        );
-        app.permission_request = Some(pr);
-
-        // Simulate pressing 'P' (prefix-allow key).
-        let key = KeyEvent {
-            code: KeyCode::Char('P'),
-            modifiers: KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        app.handle_permission_key(key);
-
-        // Dialog should be dismissed and "git" added to the allowlist.
-        assert!(app.permission_request.is_none());
-        assert!(app.bash_command_allowed_by_prefix("git status"));
-        assert!(app.bash_command_allowed_by_prefix("git push origin main"));
-        // Other commands should NOT be allowed.
-        assert!(!app.bash_command_allowed_by_prefix("rm -rf /tmp"));
-    }
-
-    #[test]
-    fn test_bash_prefix_allowlist_via_enter_on_p_option() {
-        use crate::dialogs::PermissionRequest;
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-        let mut app = make_app();
-        let mut pr = PermissionRequest::bash(
-            "tu-2".to_string(),
-            "Bash".to_string(),
-            "This will execute a shell command.".to_string(),
-            "cargo build".to_string(),
-            Some("cargo".to_string()),
-        );
-        // Navigate to the prefix option (index 3 in a 5-option dialog).
-        pr.selected_option = 3;
-        app.permission_request = Some(pr);
-
-        // Press Enter to confirm the currently selected (prefix) option.
-        let key = KeyEvent {
-            code: KeyCode::Enter,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        app.handle_permission_key(key);
-
-        assert!(app.permission_request.is_none());
-        assert!(app.bash_command_allowed_by_prefix("cargo test"));
-        assert!(!app.bash_command_allowed_by_prefix("make build"));
-    }
-
-    #[test]
-    fn test_bash_prefix_allowlist_non_prefix_option_does_not_add() {
-        use crate::dialogs::PermissionRequest;
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-        let mut app = make_app();
-        let pr = PermissionRequest::bash(
-            "tu-3".to_string(),
-            "Bash".to_string(),
-            "This will execute a shell command.".to_string(),
-            "npm install".to_string(),
-            Some("npm".to_string()),
-        );
-        app.permission_request = Some(pr);
-
-        // Press 'y' (allow-once) — should NOT add to allowlist.
-        let key = KeyEvent {
-            code: KeyCode::Char('y'),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        app.handle_permission_key(key);
-
-        assert!(app.permission_request.is_none());
-        assert!(!app.bash_command_allowed_by_prefix("npm test"));
-    }
-
     // ---- issue #47: shortcuts on non-English (Cyrillic) keyboard layouts ----
 
     #[test]
@@ -1099,7 +997,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
         session.title = Some(title.to_string());
         session.working_dir = Some(working_dir.to_string_lossy().into_owned());
         session.add_message(Message::user("hello"));
-        claurst_core::history::save_session(&session).await.unwrap();
+        claurst_core::history::save_session(&mut session).await.unwrap();
         session.id
     }
 
@@ -1205,4 +1103,228 @@ use super::types::{ContextMenuItem, ContextMenuState};
         let pin = models.iter().find(|m| &*m.id == model).unwrap();
         assert_eq!(u64::from(pin.context_window), app.context_window_size);
         assert_eq!(pin.max_output_tokens, 131_072);
+    }
+
+    // ---- /rewind into the compaction archive (issue #449) ----
+
+    #[test]
+    fn rewind_flow_lists_archived_messages_and_defers_rewinds_into_them() {
+        let mut app = make_app();
+        app.replace_messages(vec![Message::user("summary"), Message::assistant("a2")]);
+        let archived = [Message::user("u1"), Message::assistant("a1")];
+        app.open_rewind_flow_with_archive(archived.iter());
+        assert_eq!(app.rewind_archive_len, 2);
+
+        // The selection starts on the newest message (position 3); move up
+        // to "a1" (position 1, inside the archive) and confirm.
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(1));
+        assert_eq!(app.messages.len(), 2, "the caller applies archive rewinds");
+
+        // A live position ("a2", position 3) truncates the display in place
+        // and is handed to the host as archive length + display index.
+        app.pending_rewind = None;
+        app.open_rewind_flow_with_archive(archived.iter());
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(3));
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    // ---- context meter (#444) ----
+
+    fn request_done(input: u64, output: u64, cache_write: u64, cache_read: u64) -> claurst_query::QueryEvent {
+        claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "tool_use".to_string(),
+            usage: Some(claurst_core::types::UsageInfo {
+                input_tokens: input,
+                output_tokens: output,
+                cache_creation_input_tokens: cache_write,
+                cache_read_input_tokens: cache_read,
+            }),
+        }
+    }
+
+    #[test]
+    fn context_meter_shows_the_last_request_prompt_not_a_running_sum() {
+        let mut app = make_app();
+        // A ten-request tool turn at ~50k context: each request resends the
+        // whole history, so the meter must stay near 50k, not reach 500k.
+        for step in 0..10u64 {
+            app.handle_query_event(request_done(1_000 + step, 300, 2_000, 47_000 + step * 100));
+        }
+        assert_eq!(app.context_used_tokens, 1_009 + 2_000 + 47_900);
+
+        // Output tokens are not part of the prompt that was sent.
+        app.handle_query_event(request_done(10, 9_999, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+
+        // A provider that reports no input usage keeps the last reading.
+        app.handle_query_event(request_done(0, 50, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 2,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert_eq!(app.context_used_tokens, 10);
+    }
+
+    #[test]
+    fn compaction_resets_the_meter_baseline() {
+        use claurst_core::history::{CompactionRecord, CompactionTrigger};
+        let mut app = make_app();
+        app.handle_query_event(request_done(500, 100, 10_000, 170_000));
+        assert_eq!(app.context_used_tokens, 180_500);
+        app.token_warning_threshold_shown = 95;
+
+        app.handle_query_event(claurst_query::QueryEvent::Compacted(CompactionRecord {
+            at: chrono::Utc::now(),
+            trigger: CompactionTrigger::Threshold,
+            summary_uuid: "s".to_string(),
+            messages_before: 40,
+            messages_after: 3,
+            tokens_before: 180_500,
+            tokens_after: 12_000,
+            summarised: true,
+            replaced: Vec::new(),
+        }));
+        assert_eq!(app.context_used_tokens, 12_000);
+        assert_eq!(app.token_warning_threshold_shown, 0);
+
+        // The next request's real prompt size replaces the estimate.
+        app.handle_query_event(request_done(800, 40, 11_000, 0));
+        assert_eq!(app.context_used_tokens, 11_800);
+    }
+
+    // ---- explicit rewind instead of display-list history sync (issue #484) ----
+
+    fn tool_use_msg(id: &str) -> Message {
+        Message::assistant_blocks(vec![claurst_core::types::ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
+        }])
+    }
+
+    fn tool_result_msg(id: &str) -> Message {
+        Message::user_blocks(vec![claurst_core::types::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: claurst_core::types::ToolResultContent::Text("out".to_string()),
+            is_error: None,
+        }])
+    }
+
+    #[test]
+    fn idle_key_after_tool_step_requests_no_rewind() {
+        let mut app = make_app();
+        // Model history after one tool step. The display never receives the
+        // tool_use / tool_result messages, so it ends up shorter than this.
+        let history = [
+            Message::user("list files"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("done"),
+        ];
+        app.push_message(Message::user("list files"));
+        app.is_streaming = true;
+        app.handle_query_event(claurst_query::QueryEvent::ToolStart {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            input_json: r#"{"command":"ls"}"#.to_string(),
+        });
+        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            result: "out".to_string(),
+            is_error: false,
+        });
+        app.streaming_text = "done".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert!(!app.is_streaming);
+        assert!(app.messages.len() < history.len());
+
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        // The host loop touches the model history only on an explicit rewind.
+        assert_eq!(app.pending_rewind, None);
+    }
+
+    #[test]
+    fn confirmed_rewind_sets_pending_rewind() {
+        let mut app = make_app();
+        app.replace_messages(vec![
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ]);
+        app.open_rewind_flow();
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(2));
+        assert_eq!(app.messages.len(), 2);
+    }
+
+    #[test]
+    fn rewind_cut_index_plain_turns() {
+        let history = [
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        assert_eq!(rewind_cut_index(&history, 0), 0);
+        assert_eq!(rewind_cut_index(&history, 2), 2);
+        assert_eq!(rewind_cut_index(&history, 4), 4);
+        assert_eq!(rewind_cut_index(&history, 9), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_keeps_tool_step_before_cut() {
+        let history = [
+            Message::user("one"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        // Rewinding to "two" keeps the whole first turn, tool pair included.
+        assert_eq!(rewind_cut_index(&history, 4), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_skips_aborted_marker() {
+        let history = [
+            Message::user("one"),
+            Message::assistant("partial"),
+            Message::user(claurst_core::system_prompt::TURN_ABORTED_MESSAGE),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        // The display hides the marker: display index 2 is "two" (history 3).
+        assert_eq!(rewind_cut_index(&history, 2), 3);
+        assert_eq!(rewind_cut_index(&history, 3), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_snaps_off_unpaired_tool_use() {
+        let history = [
+            Message::user("one"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("a1"),
+        ];
+        // Selecting the tool_result would orphan the tool_use: cut before it.
+        assert_eq!(rewind_cut_index(&history, 2), 1);
     }

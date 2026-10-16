@@ -121,6 +121,7 @@ fn normalize_key(k: &str) -> String {
         "pageup" | "pgup" => "pageup".to_string(),
         "pagedown" | "pgdn" | "pgdown" => "pagedown".to_string(),
         "home" => "home".to_string(),
+        "ins" | "insert" => "insert".to_string(),
         "end" => "end".to_string(),
         "tab" => "tab".to_string(),
         k => k.to_string(),
@@ -411,8 +412,12 @@ impl UserKeybindings {
         // Warn about and filter out non-rebindable keys
         let original_len = kb.bindings.len();
         kb.bindings.retain(|binding| {
-            let normalized = binding.chord.to_lowercase();
-            if NON_REBINDABLE.iter().any(|protected| normalized == *protected) {
+            // Compare canonical chords, not raw strings: aliases such as
+            // "control+c" or "CTRL+C" must still hit the protected-key guard.
+            let is_protected = parse_chord(&binding.chord)
+                .map(|chord| format_chord_string(&chord))
+                .is_some_and(|canonical| NON_REBINDABLE.contains(&canonical.as_str()));
+            if is_protected {
                 warn!("Cannot rebind protected key '{}' in keybindings.json", binding.chord);
                 return false;
             }
@@ -704,6 +709,39 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_keystroke_insert_aliases() {
+        // #495: `insert` (used by Shift+Insert) had no key-name mapping, so
+        // the shell-level binding table could never reference it.
+        let ks = parse_keystroke("shift+insert").unwrap();
+        assert_eq!(ks.key, "insert");
+        assert!(ks.shift);
+        let alias = parse_keystroke("ins").unwrap();
+        assert_eq!(alias.key, "insert");
+    }
+
+    #[test]
+    fn test_resolver_reaches_shift_insert_binding() {
+        // A Shift+Insert binding must resolve now that the key name is wired
+        // (previously no lookup ever produced the "insert" key name).
+        let user = UserKeybindings::from_json_str(
+            r#"{
+  "bindings": [
+    {
+      "context": "Chat",
+      "bindings": {
+        "shift+insert": "openHelp"
+      }
+    }
+  ]
+}"#,
+        );
+        let mut resolver = KeybindingResolver::new(&user);
+        let ks = parse_keystroke("shift+insert").unwrap();
+        let result = resolver.process(ks, &KeyContext::Chat);
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "openHelp"));
+    }
+
+    #[test]
     fn test_parse_chord_single() {
         let chord = parse_chord("ctrl+c").unwrap();
         assert_eq!(chord.len(), 1);
@@ -777,6 +815,25 @@ mod tests {
     }
 
     #[test]
+    fn test_default_ctrl_shift_f_maps_to_global_search_alias() {
+        // #495: ctrl+shift+f defaults to "globalSearch", which the TUI treats
+        // as an alias of "openSearch". Keep this contract test so the alias
+        // is not dropped in favour of the dead name (or vice versa).
+        let bindings = default_bindings();
+        let action = bindings
+            .iter()
+            .find(|b| {
+                b.chord.len() == 1
+                    && b.chord[0].ctrl
+                    && b.chord[0].shift
+                    && b.chord[0].key == "f"
+                    && b.context == KeyContext::Chat
+            })
+            .and_then(|b| b.action.as_deref());
+        assert_eq!(action, Some("globalSearch"));
+    }
+
+    #[test]
     fn test_resolver_simple_action() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
@@ -845,6 +902,37 @@ mod tests {
         assert_eq!(user.bindings[0].action.as_deref(), Some("chat:externalEditor"));
         assert_eq!(user.bindings[1].chord, "space");
         assert_eq!(user.bindings[1].action, None);
+    }
+
+    #[test]
+    fn test_non_rebindable_filter_normalizes_chord_spellings() {
+        // #495: the guard compared raw strings, so `control+c`/`CTRL+D` slipped
+        // through and silently rebound keys that are meant to stay protected.
+        let user = UserKeybindings::from_json_str(
+            r#"{
+  "bindings": [
+    {
+      "context": "Chat",
+      "bindings": {
+        "control+c": "chat:submit",
+        "CTRL+D": "chat:exit",
+        "ctrl+g": "chat:externalEditor"
+      }
+    }
+  ]
+}"#,
+        );
+
+        let chords: Vec<&str> = user.bindings.iter().map(|b| b.chord.as_str()).collect();
+        assert!(
+            !chords.contains(&"control+c"),
+            "control+c must be filtered as a protected Ctrl+C alias"
+        );
+        assert!(
+            !chords.contains(&"CTRL+D"),
+            "CTRL+D must be filtered as a protected Ctrl+D alias"
+        );
+        assert!(chords.contains(&"ctrl+g"), "ctrl+g is not protected and must be kept");
     }
 
     #[test]

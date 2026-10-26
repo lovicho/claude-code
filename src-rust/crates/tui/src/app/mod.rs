@@ -122,6 +122,11 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
 pub struct App {
     // Core state
     pub config: Config,
+    /// Names of MCP servers the user disabled (persisted in global settings
+    /// under `disabledMcpServers`). Populated by the CLI at startup and after
+    /// `/mcp enable|disable` reconnects. Used to render the `disabled` state
+    /// in the /mcp view.
+    pub disabled_mcp_servers: std::collections::HashSet<String>,
     pub cost_tracker: Arc<CostTracker>,
     pub messages: Vec<Message>,
     /// Combined display list kept in sync with `messages`: real conversation turns
@@ -404,6 +409,17 @@ pub struct App {
     /// When `true`, the main event loop should spawn an async task to load
     /// the session list from disk and populate the session browser.
     pub session_list_pending: bool,
+    /// Session id selected for resume in the session browser. Set by the
+    /// `resumeSession` keybinding action; drained by the main loop, which
+    /// performs the same session swap as the /resume command.
+    pub session_resume_pending: Option<String>,
+    /// Browser rename request, persisted by the idle main loop so a live
+    /// session's in-memory title and journal cannot diverge.
+    pub session_rename_pending: Option<(String, String)>,
+    /// Id of the session the live REPL is currently continuing. The browser's
+    /// rename flow uses it to update the live title only when the renamed
+    /// entry IS the current session.
+    pub current_session_id: Option<String>,
     /// Receiver for background session-list results.
     pub session_list_rx:
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
@@ -432,6 +448,7 @@ pub struct App {
     /// When `true`, the main loop will inject a synthetic Enter event on the
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
+    parked_session_inputs: std::collections::HashMap<String, steering::ParkedSessionInput>,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -530,6 +547,14 @@ pub struct App {
     /// None when no goal is active. Updated by the REPL after each turn.
     pub active_goal_badge: Option<String>,
 
+    /// Number of discovered skills (from `.claurst/skills/` etc.) for the
+    /// status-bar indicator. Populated by the caller after `App::new` so the
+    /// constructor stays cheap and never runs filesystem/network discovery.
+    pub skill_count: usize,
+    /// Number of connected MCP servers for the status-bar indicator.
+    /// Updated by the REPL whenever the MCP runtime (re)connects.
+    pub mcp_server_count: usize,
+
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
@@ -569,6 +594,30 @@ pub struct App {
     /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
     pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
 
+    // ---- Keyboard text selection state ----------------------------------
+    /// Keyboard selection mode active (entered with `ctrl+x v`).
+    pub kb_select_mode: bool,
+    pub kb_terminal_width: u16,
+    pub last_terminal_width: Cell<u16>,
+    /// Cursor line for keyboard selection, as a content line index into the
+    /// transcript (0 = topmost rendered line), NOT a screen row. Content-
+    /// anchored so the selection survives scrolling. Width changes cancel it.
+    pub kb_cursor_line: usize,
+    /// Content line index where the selection was anchored on entry. Line-based
+    /// counterpart of the mouse `selection_anchor`.
+    pub kb_anchor_line: usize,
+    /// Flattened text of every rendered transcript line (index-aligned with
+    /// the content lines), cached at render time while keyboard selection mode
+    /// is active. Copy reads from it so a selection that extends beyond the
+    /// viewport still copies the full text.
+    pub kb_line_text: RefCell<Vec<String>>,
+    /// Screen-row projection of kb_anchor_line for the current frame, written
+    /// by the renderer (render_messages) and read by the selection-highlight
+    /// post-pass. The renderer owns this mapping; keys.rs never writes it.
+    pub kb_anchor_screen_row: Cell<u16>,
+    /// Screen-row projection of kb_cursor_line for the current frame.
+    pub kb_cursor_screen_row: Cell<u16>,
+
     // ---- Advanced mouse interaction state --------------------------------
     /// Timestamp of the last left mouse click (for double/triple-click detection).
     pub last_click_time: Option<std::time::Instant>,
@@ -584,6 +633,13 @@ pub struct App {
     scroll_accel: f32,
     /// Timestamp of the last scroll event (for burst detection).
     scroll_last_time: Option<std::time::Instant>,
+
+    // ---- Bash prefix allowlist -------------------------------------------
+    /// Command prefixes that have been permanently allowed this session via
+    /// the "Allow commands starting with X" option in the bash permission dialog.
+    /// Before showing the dialog for a bash command, the first whitespace-delimited
+    /// word is checked against this set; a match silently auto-approves the request.
+    pub bash_prefix_allowlist: std::collections::HashSet<String>,
 
     // ---- Auto-update notification ----------------------------------------
     /// If a newer version was found during background update check, this holds
@@ -630,7 +686,7 @@ impl App {
             reg.apply_model_overrides(&config.model_overrides);
             reg
         };
-        Self {
+        let app = Self {
             config,
             cost_tracker,
             messages: Vec::new(),
@@ -729,6 +785,7 @@ impl App {
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
+            disabled_mcp_servers: std::collections::HashSet::new(),
             session_branching: crate::session_branching::SessionBranchingState::new(),
             tasks_overlay: TasksOverlay::new(),
             export_dialog: ExportDialogState::new(),
@@ -757,6 +814,9 @@ impl App {
             model_picker_fetch_pending: false,
             model_picker_provider_id: None,
             session_list_pending: false,
+            session_resume_pending: None,
+            session_rename_pending: None,
+            current_session_id: None,
             session_list_rx: None,
             recent_sessions: Vec::new(),
             // Load recent activity once, lazily, on the first run-loop iteration.
@@ -767,6 +827,7 @@ impl App {
             command_queue: None,
             pending_steers: Vec::new(),
             pending_auto_submit: false,
+            parked_session_inputs: std::collections::HashMap::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
@@ -845,6 +906,8 @@ impl App {
             worktree_branch: None,
             agent_type_badge: None,
             active_goal_badge: None,
+            skill_count: 0,
+            mcp_server_count: 0,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
@@ -860,17 +923,38 @@ impl App {
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
             last_row_text: RefCell::new(std::collections::HashMap::new()),
+            kb_select_mode: false,
+            kb_terminal_width: 0,
+            last_terminal_width: Cell::new(0),
+            kb_cursor_line: 0,
+            kb_anchor_line: 0,
+            kb_line_text: RefCell::new(Vec::new()),
+            kb_anchor_screen_row: Cell::new(0),
+            kb_cursor_screen_row: Cell::new(0),
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
             context_menu_state: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
+            bash_prefix_allowlist: std::collections::HashSet::new(),
             update_available: None,
             managed_agent_cost_breakdown: None,
             managed_agents_active: false,
             last_exit_key_warning: None,
             exit_key_sequence_start: None,
+        };
+        app.init_theme();
+        app
+    }
+
+    /// Publish the theme configured in `config.theme` to the theme module so
+    /// the render pass applies it. Unknown theme names fall back to the
+    /// native ("default") palette.
+    fn init_theme(&self) {
+        let name = self.config.theme.name();
+        if let Err(error) = crate::theme::set_theme(name, Some(&crate::themes_dir())) {
+            tracing::warn!("failed to load theme '{}': {}", name, error);
         }
     }
 
@@ -998,8 +1082,34 @@ impl App {
         );
     }
 
+    /// Apply the theme given as a `Theme` enum value: publish the matching
+    /// palette to the theme module and update `self.config.theme` so the next
+    /// frame renders with the new palette. Persistence is left to the caller
+    /// (the config command already saved settings).
+    ///
+    /// Returns `false` and sets a status message when the theme fails to
+    /// load, so the caller can keep the error instead of a success message.
+    pub fn apply_theme_name(&mut self, theme: &Theme) -> bool {
+        let name = theme.name();
+        if let Err(error) = crate::theme::set_theme(name, Some(&crate::themes_dir())) {
+            self.status_message =
+                Some(format!("Theme '{}' failed to load: {}", name, error));
+            return false;
+        }
+        self.config.theme = theme.clone();
+        true
+    }
+
     /// Apply a theme by name, persisting it to config.
+    ///
+    /// Also publishes the theme to the theme module so the next frame is
+    /// rendered with the new palette. Persistence errors are surfaced as a
+    /// status message but do not roll back the in-memory theme.
     pub fn apply_theme(&mut self, theme_name: &str) {
+        if let Err(error) = crate::theme::set_theme(theme_name, Some(&crate::themes_dir())) {
+            self.status_message = Some(format!("Theme '{}' failed to load: {}", theme_name, error));
+            return;
+        }
         let theme = match theme_name {
             "dark" => Theme::Dark,
             "light" => Theme::Light,

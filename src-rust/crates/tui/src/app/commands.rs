@@ -1,6 +1,5 @@
 //! Slash-command catalog and dispatch.
 
-use claurst_core::config::Theme;
 use claurst_core::types::Role;
 use crate::notifications::NotificationKind;
 use crate::overlays::HelpEntry;
@@ -200,14 +199,7 @@ impl App {
                 true
             }
             "theme" => {
-                let current = match &self.config.theme {
-                    Theme::Dark => "dark",
-                    Theme::Light => "light",
-                    Theme::Default => "default",
-                    Theme::Deuteranopia => "deuteranopia",
-                    Theme::Custom(s) => s.as_str(),
-                };
-                self.theme_screen.open(current);
+                self.theme_screen.open(self.config.theme.name());
                 true
             }
             "stats" => {
@@ -278,10 +270,10 @@ impl App {
                 self.session_list_pending = true;
                 true
             }
-            // `/new` (opencode's lazy-home) resets the same visible transcript
-            // state as `/clear`; the CLI layer then swaps in a brand-new session
-            // and overrides the status line to "Started a new session.".
-            "clear" | "new" => {
+            // The CLI publishes /new only after outgoing checkpoint and
+            // queue parking succeed; retain the live transcript until then.
+            "new" => true,
+            "clear" => {
                 self.messages.clear();
                 self.system_annotations.clear();
                 self.display_messages.clear();

@@ -712,6 +712,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -739,6 +740,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "futures",
+ "nix 0.29.0",
  "parking_lot",
  "serde",
  "serde_json",
@@ -760,6 +762,7 @@ dependencies = [
  "bytes",
  "chrono",
  "claurst-core",
+ "claurst-schema-dialect",
  "futures",
  "hex",
  "hmac",
@@ -770,6 +773,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -984,6 +988,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "claurst-schema-dialect"
+version = "0.2.0"
+dependencies = [
+ "claurst-schema-dialect",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "claurst-tools"
 version = "0.2.0"
 dependencies = [
@@ -1056,6 +1071,7 @@ dependencies = [
  "syntect",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "unicode-width 0.2.0",
 ]

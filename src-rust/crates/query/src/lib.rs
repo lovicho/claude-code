@@ -16,45 +16,46 @@ pub mod agent_tool;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
-pub mod continuation;
-pub mod goal_loop;
-pub mod managed_orchestrator;
 pub mod compact;
 pub mod context_analyzer;
+pub mod continuation;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod goal_loop;
+pub mod managed_orchestrator;
 pub mod sanitize;
 pub mod session_memory;
 
 mod runner;
-pub use runner::*;
-pub use agent_tool::{AgentTool, init_team_swarm_runner};
-pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
+pub use agent_tool::{init_team_swarm_runner, AgentTool};
+pub use command_queue::{drain_command_queue, CommandPriority, CommandQueue, QueuedCommand};
+pub use compact::{
+    auto_compact_if_needed, auto_compact_threshold, calculate_messages_to_keep_index,
+    calculate_token_warning_state, calculate_token_warning_state_for_window, compact_conversation,
+    context_collapse, context_window_for_model, estimate_context_tokens, format_compact_summary,
+    get_compact_prompt, group_messages_for_compact, micro_compact_if_needed, reactive_compact,
+    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
+    should_context_collapse, snip_compact, summary_token_budget, AutoCompactState, CompactResult,
+    CompactTrigger, Compaction, CompactionRecord, CompactionTrigger, MessageGroup,
+    MicroCompactConfig, TokenWarningState, UsageMark,
+};
 pub use continuation::{
     ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
 };
-pub use cron_scheduler::start_cron_scheduler;
+pub use cron_scheduler::{start_cron_scheduler, ToolListProvider};
 pub use goal_loop::{
-    GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
-    mark_goal_complete,
+    check_and_continue_goal, decide_goal_continuation, mark_goal_complete, GoalContinuation,
+    StopReason,
 };
+pub use runner::*;
 pub use sanitize::sanitize_history;
-pub use compact::{
-    AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
-    auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
-    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
-    context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
-    group_messages_for_compact, micro_compact_if_needed, reactive_compact,
-    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, snip_compact, auto_compact_threshold, summary_token_budget, Compaction,
-    CompactionRecord, CompactionTrigger, UsageMark,
-};
 pub use session_memory::{
-    ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
+    await_pending_extractions, build_transcript, extract_and_store, extraction_allowed,
+    parse_extraction_response, spawn_extraction, ExtractionCursor, ExtractionRoute,
 };
 
 use claurst_api::{
-    ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
+    AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemBlock, SystemPrompt,
 };
 use claurst_core::config::Config;
@@ -77,7 +78,10 @@ pub enum QueryOutcome {
     /// The model finished its turn (end_turn stop reason).
     EndTurn { message: Message, usage: UsageInfo },
     /// The model hit max_tokens.
-    MaxTokens { partial_message: Message, usage: UsageInfo },
+    MaxTokens {
+        partial_message: Message,
+        usage: UsageInfo,
+    },
     /// The conversation was cancelled by the user.
     Cancelled,
     /// An unrecoverable error occurred.
@@ -106,6 +110,11 @@ pub struct QueryConfig {
     /// Session context gathered at startup (git status, IDE context).
     /// Sent in the dynamic system block, after the cached stable block.
     pub session_context: Option<String>,
+    /// Memory index content injected into the dynamic system block
+    /// (`<memory>` section) when auto-memory is enabled. Refreshed by the
+    /// query loop each turn from the memdir store so extracted facts
+    /// surface on the next turn. Empty: no memory section.
+    pub memory_content: String,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
@@ -217,6 +226,7 @@ impl Default for QueryConfig {
             system_prompt: None,
             append_system_prompt: None,
             session_context: None,
+            memory_content: String::new(),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -257,6 +267,69 @@ fn persist_step(config: &QueryConfig, messages: &[Message]) {
     }
 }
 
+/// Load the memory index content for a config, or an empty string when
+/// auto-memory is disabled or the project dir is unknown. Used to seed
+/// `QueryConfig::memory_content` at construction; the query loop refreshes
+/// it every turn so turn-end extraction surfaces on the next request.
+fn memory_content_for_config(cfg: &Config) -> String {
+    if !claurst_core::memdir::is_auto_memory_enabled(cfg.auto_memory_enabled) {
+        return String::new();
+    }
+    match &cfg.project_dir {
+        Some(dir) => {
+            let store_dir = claurst_core::memdir::memory_store_dir(dir);
+            claurst_core::memdir::build_memory_prompt_content(&store_dir)
+        }
+        None => String::new(),
+    }
+}
+
+/// Answer vetoed tool calls before returning so the journal and UI retain a
+/// complete tool-use/result sequence without executing any tools or tool hooks.
+fn reject_model_turn_tools(
+    assistant: &Message,
+    reason: &str,
+    messages: &mut Vec<Message>,
+    config: &QueryConfig,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) {
+    let mut results = Vec::new();
+    for block in assistant.get_tool_use_blocks() {
+        if let ContentBlock::ToolUse {
+            id, name, input, ..
+        } = block
+        {
+            let error = format!("Blocked by PostModelTurn hook: {reason}");
+            if let Some(tx) = event_tx {
+                let _ = tx.send(QueryEvent::ToolStart {
+                    tool_name: name.clone(),
+                    tool_id: id.clone(),
+                    input_json: input.to_string(),
+                });
+                let _ = tx.send(QueryEvent::ToolEnd {
+                    tool_name: name.clone(),
+                    tool_id: id.clone(),
+                    result: error.clone(),
+                    is_error: true,
+                });
+            }
+            results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: ToolResultContent::Text(error),
+                is_error: Some(true),
+            });
+        }
+    }
+    if !results.is_empty() {
+        let message = Message::user_blocks(results);
+        if let Some(tx) = event_tx {
+            let _ = tx.send(QueryEvent::MessageCommitted(message.clone()));
+        }
+        messages.push(message);
+        persist_step(config, messages);
+    }
+}
+
 impl QueryConfig {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
@@ -264,10 +337,8 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_content: memory_content_for_config(cfg),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
@@ -288,10 +359,8 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_content: memory_content_for_config(cfg),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
@@ -307,11 +376,24 @@ pub enum QueryEvent {
     /// A stream event from the API.
     Stream(AnthropicStreamEvent),
     /// A tool is about to be executed.
-    ToolStart { tool_name: String, tool_id: String, input_json: String },
+    ToolStart {
+        tool_name: String,
+        tool_id: String,
+        input_json: String,
+    },
     /// A tool has finished executing.
-    ToolEnd { tool_name: String, tool_id: String, result: String, is_error: bool },
+    ToolEnd {
+        tool_name: String,
+        tool_id: String,
+        result: String,
+        is_error: bool,
+    },
     /// The model finished a turn.
-    TurnComplete { turn: u32, stop_reason: String, usage: Option<UsageInfo> },
+    TurnComplete {
+        turn: u32,
+        stop_reason: String,
+        usage: Option<UsageInfo>,
+    },
     /// An informational status message.
     Status(String),
     /// An error.
@@ -319,17 +401,28 @@ pub enum QueryEvent {
     /// Token usage has crossed a warning threshold.
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
-    TokenWarning { state: TokenWarningState, pct_used: f64 },
+    TokenWarning {
+        state: TokenWarningState,
+        pct_used: f64,
+    },
     /// A model request failed transiently and will be retried after
     /// `delay_ms` (#439). `attempt` is 1-based and at most `max_attempts`.
     /// Output streamed by the failed attempt is discarded.
-    Retry { attempt: u32, max_attempts: u32, delay_ms: u64, reason: String },
+    Retry {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    },
     /// The loop compacted the history (issue #441). The caller records the
     /// entry in the session; `tokens_after` is the new context estimate.
     Compacted(CompactionRecord),
     /// Provider-reported subscription usage (0-100 per window), e.g. the
     /// Codex `x-codex-*` rate-limit headers.
-    RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
+    RateLimits {
+        primary_used_percent: Option<f32>,
+        secondary_used_percent: Option<f32>,
+    },
     /// Queued input drained from [`QueryConfig::command_queue`] at a step
     /// boundary and appended to the history as user messages, in order
     /// (#444): steers typed during the turn and background-task completion
@@ -439,10 +532,7 @@ fn effective_effort_for_turn(
 fn effective_output_style_for_turn(
     config: &QueryConfig,
     messages: &[Message],
-) -> (
-    claurst_core::system_prompt::OutputStyle,
-    Option<String>,
-) {
+) -> (claurst_core::system_prompt::OutputStyle, Option<String>) {
     if let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) {
         if let Some(style_name) =
             claurst_core::keywords::inline_persona_style(&last_user.get_all_text())
@@ -524,6 +614,11 @@ pub async fn run_query_loop(
     // Retries spent on the current model request (#439). Bounded by
     // `config.retry.max_retries`; reset once a response streams to completion.
     let mut retry_attempt: u32 = 0;
+    // Schema-rejection recovery: at most one re-filter retry per turn. A
+    // provider 400 naming a rejected JSON Schema keyword (see
+    // claurst-schema-dialect) is learned globally, then this turn restarts so
+    // `provider_tools` is re-filtered without the offending construct.
+    let mut schema_recovery_used = false;
     // Max-steps graceful degradation (issue #230 / MI-3): set once the final
     // tool-less summary turn has been dispatched so it can never re-trigger
     // (anti-recursion guard).
@@ -537,7 +632,8 @@ pub async fn run_query_loop(
     // Without the explicit override field, agent definitions like the
     // built-in `plan` agent (max_turns: Some(20)) would silently ignore a
     // user-requested cap change.
-    let effective_max_turns = config.max_turns_override
+    let effective_max_turns = config
+        .max_turns_override
         .or_else(|| config.agent_definition.as_ref().and_then(|a| a.max_turns))
         .unwrap_or(config.max_turns);
 
@@ -582,7 +678,9 @@ pub async fn run_query_loop(
         let degradation_turn = if turn > effective_max_turns {
             if !degradation_done {
                 if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::MaxTurnsReached { max_turns: effective_max_turns });
+                    let _ = tx.send(QueryEvent::MaxTurnsReached {
+                        max_turns: effective_max_turns,
+                    });
                 }
             }
             if !config.degradation_enabled || degradation_done {
@@ -658,6 +756,7 @@ pub async fn run_query_loop(
                         turn = 0;
                         max_tokens_recovery_count = 0;
                         retry_attempt = 0;
+                        schema_recovery_used = false;
                         goal_turn_start = std::time::Instant::now();
                         continue;
                     }
@@ -721,18 +820,55 @@ pub async fn run_query_loop(
             }};
         }
 
+        // Schema-rejection recovery (claurst-schema-dialect): a hard 400 that
+        // names a rejected JSON Schema keyword is not transient but IS
+        // recoverable: learn the construct globally, then restart the turn so
+        // `provider_tools` is re-filtered without it. Once per turn: a retry
+        // the dialect cannot improve would loop on a byte-identical request.
+        // The transient budgets reset with the fresh request, matching the
+        // fresh-continuation reset above: a turn that already spent retries
+        // before the rejection must not re-enter with a depleted budget.
+        macro_rules! recover_schema {
+            ($provider_id:expr, $err:expr) => {{
+                if !schema_recovery_used {
+                    if let Some(what) = claurst_api::schema_dialect_map::recover_description(
+                        $provider_id,
+                        &$err.to_string(),
+                    ) {
+                        schema_recovery_used = true;
+                        retry_attempt = 0;
+                        max_tokens_recovery_count = 0;
+                        warn!(
+                            provider = %$provider_id,
+                            learned = %what,
+                            "Schema rejection recognized; re-filtering tool schemas and retrying"
+                        );
+                        turn -= 1;
+                        continue;
+                    }
+                }
+            }};
+        }
+
         // Stop / SubagentStop hooks (#447), fired exactly once for each
         // finished turn. A hook that blocks the stop has its reason sent to
         // the model and the loop continues.
         macro_rules! fire_stop_hooks {
             ($assistant_msg:expr) => {{
-                if let Some(reason) =
-                    stop_hooks(&$assistant_msg, stop_hook_active, config.is_subagent, tool_ctx).await
+                if let Some(reason) = stop_hooks(
+                    &$assistant_msg,
+                    stop_hook_active,
+                    config.is_subagent,
+                    tool_ctx,
+                )
+                .await
                 {
                     stop_hook_active = true;
                     let feedback = Message::user(format!("Stop hook feedback: {reason}"));
                     if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(format!("Stop hook blocked stopping: {reason}")));
+                        let _ = tx.send(QueryEvent::Status(format!(
+                            "Stop hook blocked stopping: {reason}"
+                        )));
                         let _ = tx.send(QueryEvent::MessageCommitted(feedback.clone()));
                     }
                     messages.push(feedback);
@@ -756,13 +892,29 @@ pub async fn run_query_loop(
             }
         }
 
+        // Durable steering (soft interrupts): for the interactive session's
+        // queue — journaled (#449) and not a sub-agent — push, remove and
+        // drain mirror into the soft-interrupt store, and interrupts a
+        // previous run persisted are restored here, before the first drain.
+        // Sub-agents and headless runs persist nothing.
+        if let Some(queue) = config.command_queue.as_ref() {
+            if config.session_journal.is_some() && !config.is_subagent {
+                if let Err(error) = queue.enable_persistence(&tool_ctx.session_id) {
+                    return QueryOutcome::Error(error);
+                }
+            }
+        }
+
         // Step boundary (#444): deliver queued input — steers typed while the
         // turn ran and background-task completion notices — before the next
         // model request. They are appended after the last tool results, in
         // queue order, and reported so the UI can show them where they landed.
         if let Some(ref cq) = config.command_queue {
             if !cq.is_empty() {
-                let injected = drain_command_queue(cq);
+                let injected = match command_queue::deliver_command_queue(cq, messages, config.session_journal.as_deref()) {
+                    Ok(injected) => injected,
+                    Err(error) => return QueryOutcome::Error(error),
+                };
                 if !injected.is_empty() {
                     debug!(count = injected.len(), "Injecting command-queue messages");
                     if let Some(ref tx) = event_tx {
@@ -770,7 +922,6 @@ pub async fn run_query_loop(
                             injected.iter().map(Message::get_all_text).collect(),
                         ));
                     }
-                    messages.extend(injected);
                 }
             }
         }
@@ -784,6 +935,17 @@ pub async fn run_query_loop(
         let route = config.provider_registry.as_deref().map(|registry| {
             resolve_provider_route(registry, config, tool_ctx, &effective_model, client)
         });
+        // Stash for the turn-end memory extraction hook: the provider Arc is
+        // cheap to clone and `route` is moved into the dispatch block below.
+        let extraction_provider = route.as_ref().and_then(|r| r.provider.clone());
+        let extraction_provider_id = route
+            .as_ref()
+            .map(|r| r.provider_id.clone())
+            .unwrap_or_else(|| "anthropic".to_string());
+        let extraction_model_id = route
+            .as_ref()
+            .map(|r| r.model_id.clone())
+            .unwrap_or_else(|| effective_model.clone());
 
         // Pre-request compaction check point (issue #441). It runs before
         // every request, including the one that follows each tool batch, so
@@ -849,7 +1011,10 @@ pub async fn run_query_loop(
         *messages = sanitize::sanitize_history(std::mem::take(messages));
 
         // Build API request
-        let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
+        let api_messages: Vec<ApiMessage> = claurst_api::normalize_anthropic_messages(messages)
+            .iter()
+            .map(ApiMessage::from)
+            .collect();
         // Max-steps degradation: the final summary turn is dispatched with NO
         // tool definitions so the model can only produce text (issue #230).
         let api_tools: Vec<ApiToolDefinition> = if degradation_turn {
@@ -887,8 +1052,7 @@ pub async fn run_query_loop(
             // up; sub-agents already set it explicitly, so only fill it in when
             // the caller left it unset.
             if patched.enabled_tools.is_none() {
-                patched.enabled_tools =
-                    Some(tools.iter().map(|t| t.name().to_string()).collect());
+                patched.enabled_tools = Some(tools.iter().map(|t| t.name().to_string()).collect());
             }
             if patched.permission_mode.is_none() {
                 patched.permission_mode = Some(tool_ctx.config.permission_mode.clone());
@@ -904,6 +1068,21 @@ pub async fn run_query_loop(
             patched.sandbox_state =
                 claurst_core::sandbox::render_sandbox_state(&tool_ctx.config.sandbox);
 
+            // Memory index injection: when the auto-memory switches allow it,
+            // load the store's MEMORY.md index and inject it into the
+            // dynamic system block. The store dir is the same hash-keyed dir
+            // the turn-end extractor writes to (`memory_store_dir`), so
+            // facts extracted at the end of turn N surface in turn N+1's
+            // prompt. Read fresh each turn (the index is small, capped at
+            // 200 lines / 25 KiB) and routed through `memory_content`, which
+            // `build_system_prompt` places after the dynamic boundary so the
+            // cached stable block stays byte-identical across turns.
+            if claurst_core::memdir::is_auto_memory_enabled(tool_ctx.config.auto_memory_enabled) {
+                let store_dir = claurst_core::memdir::memory_store_dir(&tool_ctx.working_dir);
+                patched.memory_content =
+                    claurst_core::memdir::build_memory_prompt_content(&store_dir);
+            }
+
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
                 if let Some(ref agent_prompt) = agent.prompt {
@@ -917,7 +1096,8 @@ pub async fn run_query_loop(
             // If managed-agent mode is active, append orchestration instructions.
             if let Some(ref ma_config) = config.managed_agents {
                 if ma_config.enabled {
-                    let ma_prompt = crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
+                    let ma_prompt =
+                        crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
                     patched.append_system_prompt = Some(match &patched.append_system_prompt {
                         Some(existing) => format!("{}\n\n{}", existing, ma_prompt),
                         None => ma_prompt,
@@ -929,10 +1109,11 @@ pub async fn run_query_loop(
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
                 if !nudge.is_empty() {
-                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
-                        Some(existing) => format!("{}\n\n{}", existing, nudge),
-                        None => nudge,
-                    });
+                    patched.append_system_prompt =
+                        Some(match patched.append_system_prompt.take() {
+                            Some(existing) => format!("{}\n\n{}", existing, nudge),
+                            None => nudge,
+                        });
                 }
             }
 
@@ -955,15 +1136,19 @@ pub async fn run_query_loop(
             // from the CLI into the loop so continuation turns get it too.
             // GoalStore access here is fully synchronous (no lock held across
             // an `.await`).
-            if matches!(config.continuation, crate::continuation::ContinuationMode::Goal) {
+            if matches!(
+                config.continuation,
+                crate::continuation::ContinuationMode::Goal
+            ) {
                 if let Some(goal) = claurst_core::GoalStore::open_default()
                     .and_then(|s| s.get_active_goal(&tool_ctx.session_id))
                 {
                     let addendum = claurst_core::goal_system_prompt_addendum(&goal);
-                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
-                        Some(existing) => format!("{}\n{}", existing, addendum),
-                        None => addendum,
-                    });
+                    patched.append_system_prompt =
+                        Some(match patched.append_system_prompt.take() {
+                            Some(existing) => format!("{}\n{}", existing, addendum),
+                            None => addendum,
+                        });
                 }
             }
 
@@ -1004,9 +1189,9 @@ pub async fn run_query_loop(
         // Resolve effective thinking budget:
         //   1. Explicit `thinking_budget` in config takes precedence.
         //   2. Fall back to the effort level's budget when no explicit budget is set.
-        let effective_thinking_budget = config.thinking_budget.or_else(|| {
-            effective_effort_level.and_then(|el| el.thinking_budget_tokens())
-        });
+        let effective_thinking_budget = config
+            .thinking_budget
+            .or_else(|| effective_effort_level.and_then(|el| el.thinking_budget_tokens()));
 
         // Claude reasoning controls: adaptive thinking + `output_config.effort`
         // on current models, `budget_tokens` on older ones (one table in
@@ -1028,9 +1213,12 @@ pub async fn run_query_loop(
         // Apply temperature: explicit config value takes precedence, then agent override,
         // then effort-level override (not for adaptive-thinking models, which
         // reject sampling parameters alongside thinking).
-        let effective_temperature = config.temperature
+        let effective_temperature = config
+            .temperature
             .or_else(|| {
-                config.agent_definition.as_ref()
+                config
+                    .agent_definition
+                    .as_ref()
                     .and_then(|a| a.temperature)
                     .map(|t| t as f32)
             })
@@ -1084,10 +1272,10 @@ pub async fn run_query_loop(
                     // with placeholder text when the provider doesn't support them,
                     // preventing crashes on text-only models.
                     let mut caps = provider.capabilities();
-                    if let Some(model_entry) = config
-                        .model_registry
-                        .as_ref()
-                        .and_then(|model_registry| model_registry.get(&provider_id_str, &model_id_str))
+                    if let Some(model_entry) =
+                        config.model_registry.as_ref().and_then(|model_registry| {
+                            model_registry.get(&provider_id_str, &model_id_str)
+                        })
                     {
                         caps.image_input = model_entry.vision();
                         caps.tool_calling = model_entry.tool_calling;
@@ -1096,30 +1284,39 @@ pub async fn run_query_loop(
                     // Max-steps degradation (issue #230): dispatch the final
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
-                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
-                        tools
-                            .iter()
-                            .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
-                            .map(|t| t.to_definition())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let provider_tools: Vec<claurst_core::types::ToolDefinition> =
+                        if caps.tool_calling && !degradation_turn {
+                            tools
+                                .iter()
+                                .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
+                                .map(|t| t.to_definition())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                     let provider_messages: Vec<claurst_core::types::Message> = messages
                         .iter()
                         .map(|msg| {
                             let mut msg = msg.clone();
-                            if let claurst_core::types::MessageContent::Blocks(ref mut blocks) = msg.content {
+                            if let claurst_core::types::MessageContent::Blocks(ref mut blocks) =
+                                msg.content
+                            {
                                 for block in blocks.iter_mut() {
                                     match block {
-                                        claurst_core::types::ContentBlock::Image { .. } if !caps.image_input => {
+                                        claurst_core::types::ContentBlock::Image { .. }
+                                            if !caps.image_input =>
+                                        {
                                             *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[Image not supported by this model]".to_string(),
+                                                text: "[Image not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
-                                        claurst_core::types::ContentBlock::Document { .. } if !caps.pdf_input => {
+                                        claurst_core::types::ContentBlock::Document { .. }
+                                            if !caps.pdf_input =>
+                                        {
                                             *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[PDF not supported by this model]".to_string(),
+                                                text: "[PDF not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
                                         _ => {}
@@ -1150,8 +1347,7 @@ pub async fn run_query_loop(
                             )
                             .thinking
                         } else {
-                            effective_thinking_budget
-                                .map(claurst_api::ThinkingConfig::enabled)
+                            effective_thinking_budget.map(claurst_api::ThinkingConfig::enabled)
                         },
                         provider_options: {
                             let mut options = build_provider_options(
@@ -1206,6 +1402,7 @@ pub async fn run_query_loop(
                                     continue;
                                 }
                             }
+                            recover_schema!(provider_id_str.as_str(), e);
                             if let claurst_api::RetryDecision::Retry { after } =
                                 claurst_api::retry::classify_provider_error(&e)
                             {
@@ -1217,19 +1414,7 @@ pub async fn run_query_loop(
                     };
 
                     // Accumulators for building the final assistant message.
-                    let mut text_chunks: Vec<String> = Vec::new();
-                    // Accumulate reasoning/thinking content for providers like
-                    // DeepSeek that require reasoning_content to be sent back.
-                    let mut thinking_chunks: Vec<String> = Vec::new();
-                    // Opaque reasoning state (Codex `encrypted_content`)
-                    // that must be replayed on the next request.
-                    let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
-                    // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
-                    // thought_signature carries Gemini's opaque per-call signature
-                    // through stream assembly so it survives into the persisted
-                    // ToolUse block and is echoed back next turn (#311).
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
-                        std::collections::HashMap::new();
+                    let mut blocks = claurst_api::provider_types::StreamBlockAccumulator::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
@@ -1279,37 +1464,12 @@ pub async fn run_query_loop(
                                             }
                                         }
 
-                                        // Accumulate response data.
+                                        // Preserve block indices and provider-owned reasoning items.
+                                        blocks.on_event(&evt);
                                         match &evt {
                                             claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
                                                 msg_id = id.clone();
                                                 merge_provider_stream_usage(&mut usage, u);
-                                            }
-                                            claurst_api::StreamEvent::ContentBlockStart {
-                                                index,
-                                                content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
-                                            } => {
-                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
-                                            }
-                                            claurst_api::StreamEvent::ContentBlockStart {
-                                                content_block: block @ ContentBlock::RedactedThinking { .. },
-                                                ..
-                                            } => {
-                                                redacted_thinking_blocks.push(block.clone());
-                                            }
-                                            claurst_api::StreamEvent::TextDelta { text, .. } => {
-                                                text_chunks.push(text.clone());
-                                            }
-                                            claurst_api::StreamEvent::ThinkingDelta { thinking, .. } => {
-                                                thinking_chunks.push(thinking.clone());
-                                            }
-                                            claurst_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
-                                                thinking_chunks.push(reasoning.clone());
-                                            }
-                                            claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
-                                                if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
-                                                    buf.push_str(partial_json);
-                                                }
                                             }
                                             claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
                                                 stop_str = match stop_reason {
@@ -1360,10 +1520,7 @@ pub async fn run_query_loop(
                     // A stalled stream is a transient failure: retry the turn
                     // while the budget allows, never accept the partial output.
                     if provider_stream_stalled {
-                        let reason = format!(
-                            "no data for {}s",
-                            provider_stall_timeout.as_secs()
-                        );
+                        let reason = format!("no data for {}s", provider_stall_timeout.as_secs());
                         retry_turn!(reason.clone(), None);
                         return QueryOutcome::Error(ClaudeError::Api(format!(
                             "Provider '{}' stream stalled (model '{}'): {}",
@@ -1400,6 +1557,7 @@ pub async fn run_query_loop(
                                 continue;
                             }
                         }
+                        recover_schema!(provider_id_str.as_str(), err);
                         if let claurst_api::RetryDecision::Retry { after } = decision {
                             retry_turn!(err.to_string(), after);
                         }
@@ -1424,61 +1582,32 @@ pub async fn run_query_loop(
                         )));
                     }
                     retry_attempt = 0;
+                    schema_recovery_used = false;
 
-                    // Build the content blocks from accumulated stream data.
-                    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-
-                    // Thinking / reasoning block — must come first so that
-                    // inject_reasoning_for_tool_turns can find it later.
-                    let combined_thinking = thinking_chunks.join("");
-                    if !combined_thinking.is_empty() {
-                        content_blocks.push(ContentBlock::Thinking {
-                            thinking: combined_thinking.clone(),
-                            signature: String::new(),
-                        });
-                    }
-                    content_blocks.append(&mut redacted_thinking_blocks);
-
-                    let combined_text = text_chunks.join("");
-                    if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: combined_text.clone() });
-                    }
-
-                    // Reconstruct tool-use blocks (sorted by index for determinism).
-                    let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
-                    tc_indices.sort();
-                    // Tool calls whose accumulated JSON arguments failed to
-                    // parse. We still emit a tool_use block (so the assistant
-                    // message stays well-formed and every tool_use has a
-                    // matching tool_result), but we must NOT execute the tool
-                    // with empty/garbage input — instead we surface a tool
-                    // error to the model so it can retry (issue #215).
-                    let mut malformed_tool_calls: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
-                    for idx in tc_indices {
-                        if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
-                            let input = match claurst_api::tool_json::parse_tool_input(&json_str) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warn!(
-                                        provider = %provider_id_str,
-                                        tool = %name,
-                                        tool_id = %id,
-                                        error = %e,
-                                        "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
-                                    );
-                                    malformed_tool_calls.insert(id.clone(), e.to_string());
-                                    // Placeholder input — this call is never executed.
-                                    serde_json::json!({})
-                                }
-                            };
-                            content_blocks.push(ContentBlock::ToolUse { id, name, input, thought_signature });
-                        }
-                    }
+                    let (content_blocks, malformed_tool_calls) = blocks.finish_with_invalid_tools();
+                    let combined_text: String = content_blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let combined_thinking: String = content_blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                            ContentBlock::ResponsesReasoning { summary, .. } => {
+                                Some(summary.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
 
                     let mut assistant_msg = Message {
                         role: claurst_core::types::Role::Assistant,
-                        content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
+                        content: claurst_core::types::MessageContent::Blocks(
+                            content_blocks.clone(),
+                        ),
                         uuid: Some(msg_id),
                         cost: None,
                         snapshot_patch: None,
@@ -1509,17 +1638,33 @@ pub async fn run_query_loop(
                                 model_turn_hooks.reason_or_default()
                             )));
                         }
-                        return QueryOutcome::EndTurn { message: assistant_msg, usage };
+                        reject_model_turn_tools(
+                            &assistant_msg,
+                            model_turn_hooks.reason_or_default(),
+                            messages,
+                            config,
+                            event_tx.as_ref(),
+                        );
+                        return QueryOutcome::EndTurn {
+                            message: assistant_msg,
+                            usage,
+                        };
                     }
 
                     // Handle tool-use turn: execute tools and loop.
-                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input, .. } = b {
-                            Some((id.clone(), name.clone(), input.clone()))
-                        } else {
-                            None
-                        }
-                    }).collect();
+                    let tool_use_blocks: Vec<_> = content_blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } = b
+                            {
+                                Some((id.clone(), name.clone(), input.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
 
                     // Execute tools if any tool_use blocks were returned.
                     // Note: we check the blocks themselves rather than relying
@@ -1611,14 +1756,18 @@ pub async fn run_query_loop(
                             let _ = tx.send(QueryEvent::Stream(
                                 AnthropicStreamEvent::ContentBlockDelta {
                                     index: 0,
-                                    delta: claurst_api::streaming::ContentDelta::TextDelta { text: placeholder.clone() },
+                                    delta: claurst_api::streaming::ContentDelta::TextDelta {
+                                        text: placeholder.clone(),
+                                    },
                                 },
                             ));
                         }
                         if let claurst_core::types::MessageContent::Blocks(ref mut blocks) =
                             assistant_msg.content
                         {
-                            blocks.push(ContentBlock::Text { text: placeholder.clone() });
+                            blocks.push(ContentBlock::Text {
+                                text: placeholder.clone(),
+                            });
                         }
                         if let Some(last) = messages.last_mut() {
                             *last = assistant_msg.clone();
@@ -1640,6 +1789,37 @@ pub async fn run_query_loop(
                         if !patch.files.is_empty() {
                             assistant_msg.snapshot_patch = Some(patch);
                         }
+                    }
+
+                    // Turn-end memory extraction (same hook as the legacy
+                    // client path below): one extra request through the ACTIVE
+                    // provider/model, results written into the memdir store.
+                    // Off unless `memoryExtractionEnabled` is set globally and
+                    // the auto-memory switches allow it; subagents never
+                    // extract. Tracked detached task so embedders that exit
+                    // right after the loop can await it.
+                    if session_memory::extraction_allowed(&tool_ctx.config, config.is_subagent) {
+                        let route = session_memory::ExtractionRoute {
+                            session_id: tool_ctx.session_id.clone(),
+                            snapshot_sequence: session_memory::next_extraction_sequence(),
+                            provider_id: provider_id_str.to_string(),
+                            model_id: model_id_str.to_string(),
+                            provider: Some(provider.clone()),
+                            anthropic_client: client.clone(),
+                            store_dir: claurst_core::memdir::memory_store_dir(
+                                &tool_ctx.working_dir,
+                            ),
+                        };
+                        let messages_clone = messages.clone();
+                        let working_dir_clone = tool_ctx.working_dir.clone();
+                        session_memory::spawn_extraction(async move {
+                            session_memory::extract_and_store(
+                                &route,
+                                &messages_clone,
+                                &working_dir_clone,
+                            )
+                            .await
+                        });
                     }
 
                     fire_stop_hooks!(assistant_msg);
@@ -1664,12 +1844,10 @@ pub async fn run_query_loop(
                         model = %model_id_str,
                         "No credentials found for provider"
                     );
-                    return QueryOutcome::Error(
-                        ClaudeError::Api(format!(
-                            "No API key for provider '{}' (model '{}'). {}",
-                            provider_id_str, model_id_str, hint
-                        ))
-                    );
+                    return QueryOutcome::Error(ClaudeError::Api(format!(
+                        "No API key for provider '{}' (model '{}'). {}",
+                        provider_id_str, model_id_str, hint
+                    )));
                 }
                 // Anthropic with no auth_store key: fall through to the raw
                 // client path below (which has its own deferred key validation
@@ -1688,10 +1866,7 @@ pub async fn run_query_loop(
             Err(e) => {
                 // Context-window error: compact once and retry, before the
                 // transient-retry policy (#441, #439).
-                if config.auto_compact
-                    && !overflow_recovery_used
-                    && claude_error_is_overflow(&e)
-                {
+                if config.auto_compact && !overflow_recovery_used && claude_error_is_overflow(&e) {
                     overflow_recovery_used = true;
                     let summariser = anthropic_summariser(client);
                     if compact_after_overflow(
@@ -1719,7 +1894,11 @@ pub async fn run_query_loop(
                 // attempt one switch to the fallback model.
                 let unavailable = matches!(
                     e,
-                    ClaudeError::RateLimit | ClaudeError::ApiStatus { status: 429 | 529, .. }
+                    ClaudeError::RateLimit
+                        | ClaudeError::ApiStatus {
+                            status: 429 | 529,
+                            ..
+                        }
                 ) || e.to_string().to_lowercase().contains("overloaded");
                 if !used_fallback && unavailable {
                     if let Some(ref fb) = config.fallback_model {
@@ -1902,9 +2081,14 @@ pub async fn run_query_loop(
         // providers that emit non-standard finish reasons).
         let raw_stop = stop_reason.as_deref().unwrap_or("end_turn");
         let stop = match raw_stop {
-            "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filtered" => raw_stop,
+            "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filtered" => {
+                raw_stop
+            }
             _ if !assistant_msg.get_tool_use_blocks().is_empty() => {
-                warn!(stop_reason = raw_stop, "Unknown stop reason with tool_use blocks present; treating as tool_use");
+                warn!(
+                    stop_reason = raw_stop,
+                    "Unknown stop reason with tool_use blocks present; treating as tool_use"
+                );
                 "tool_use"
             }
             _ => raw_stop,
@@ -1920,7 +2104,17 @@ pub async fn run_query_loop(
                     model_turn_hooks.reason_or_default()
                 )));
             }
-            return QueryOutcome::EndTurn { message: assistant_msg, usage };
+            reject_model_turn_tools(
+                &assistant_msg,
+                model_turn_hooks.reason_or_default(),
+                messages,
+                config,
+                event_tx.as_ref(),
+            );
+            return QueryOutcome::EndTurn {
+                message: assistant_msg,
+                usage,
+            };
         }
 
         if let Some(ref tx) = event_tx {
@@ -1935,59 +2129,31 @@ pub async fn run_query_loop(
             "end_turn" => {
                 fire_stop_hooks!(assistant_msg);
 
-                // Asynchronously extract and persist session memories if warranted.
-                // Runs in a detached Tokio task so it doesn't block the query loop.
-                if session_memory::SessionMemoryExtractor::should_extract(messages) {
-                    let model_clone = config.model.clone();
+                // Turn-end memory extraction: one extra request through the
+                // session's ACTIVE provider/model, results written into the
+                // memdir store. Off unless `memoryExtractionEnabled` is set
+                // globally and the auto-memory switches allow it; subagents
+                // and every other detached loop never extract. Detached task;
+                // failures are debug-logged and never affect the turn.
+                if session_memory::extraction_allowed(&tool_ctx.config, config.is_subagent) {
+                    let route = session_memory::ExtractionRoute {
+                            session_id: tool_ctx.session_id.clone(),
+                            snapshot_sequence: session_memory::next_extraction_sequence(),
+                        provider_id: extraction_provider_id.clone(),
+                        model_id: extraction_model_id.clone(),
+                        provider: extraction_provider.clone(),
+                        anthropic_client: client.clone(),
+                        store_dir: claurst_core::memdir::memory_store_dir(&tool_ctx.working_dir),
+                    };
                     let messages_clone = messages.clone();
                     let working_dir_clone = tool_ctx.working_dir.clone();
-
-                    // Build a fresh client using the same API key.  This avoids
-                    // requiring an Arc in the existing run_query_loop signature.
-                    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                        if !api_key.is_empty() {
-                            if let Ok(sm_client) = claurst_api::AnthropicClient::new(
-                                claurst_api::client::ClientConfig {
-                                    api_key,
-                                    ..Default::default()
-                                },
-                            ) {
-                                let sm_client = std::sync::Arc::new(sm_client);
-                                tokio::spawn(async move {
-                                    let extractor =
-                                        session_memory::SessionMemoryExtractor::new(&model_clone);
-                                    match extractor
-                                        .extract(&messages_clone, &working_dir_clone, &sm_client)
+                    // Tracked detached task: embedders that exit right after
+                    // the loop (headless --print) await it via
+                    // `await_pending_extractions` instead of losing the work.
+                    session_memory::spawn_extraction(async move {
+                                        session_memory::extract_and_store(&route,&messages_clone, &working_dir_clone,)
                                         .await
-                                    {
-                                        Ok(memories) if !memories.is_empty() => {
-                                            let target = working_dir_clone
-                                                .join(".claurst")
-                                                .join("AGENTS.md");
-                                            if let Err(e) =
-                                                session_memory::SessionMemoryExtractor::persist(
-                                                    &memories, &target,
-                                                )
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "Failed to persist session memories"
-                                                );
-                                            }
-                                        }
-                                        Ok(_) => {} // no memories extracted
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                error = %e,
-                                                "Session memory extraction failed (non-fatal)"
-                                            );
-                                        }
-                                    }
                                 });
-                            }
-                        }
-                    }
                 }
 
                 // Trigger AutoDream consolidation check (non-blocking, best-effort).
@@ -2121,7 +2287,10 @@ pub async fn run_query_loop(
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
-                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                    if let ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    {
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::ToolStart {
                                 tool_name: name.clone(),
@@ -2137,7 +2306,11 @@ pub async fn run_query_loop(
                         } else {
                             pre_tool_use(name, input.clone(), batch_ctx).await
                         };
-                        prepared.push(PreparedTool { id: id.clone(), name: name.clone(), call });
+                        prepared.push(PreparedTool {
+                            id: id.clone(),
+                            name: name.clone(),
+                            call,
+                        });
                     }
                 }
 
@@ -2153,12 +2326,14 @@ pub async fn run_query_loop(
                         PreToolUse::Blocked(result) => {
                             futures::future::Either::Left(std::future::ready(result.clone()))
                         }
-                        PreToolUse::Run { input, ctx } => futures::future::Either::Right(execute_batch_call(
-                            &p.name,
-                            input,
-                            tools,
-                            ctx.as_deref().unwrap_or(batch_ctx),
-                        )),
+                        PreToolUse::Run { input, ctx } => {
+                            futures::future::Either::Right(execute_batch_call(
+                                &p.name,
+                                input,
+                                tools,
+                                ctx.as_deref().unwrap_or(batch_ctx),
+                            ))
+                        }
                     })
                     .collect();
 
@@ -2177,8 +2352,7 @@ pub async fn run_query_loop(
                 // returning promptly) but still emit ToolEnd + build every result
                 // block so the conversation and TUI stay consistent. Calls that
                 // never ran get no PostToolUse.
-                let mut result_blocks: Vec<ContentBlock> =
-                    Vec::with_capacity(prepared.len() + 1);
+                let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len() + 1);
                 for (p, mut result) in prepared.iter().zip(exec_results) {
                     if let (false, PreToolUse::Run { input, .. }) = (batch_cancelled, &p.call) {
                         post_tool_use(&p.name, input, &mut result, tool_ctx).await;
@@ -2239,7 +2413,10 @@ pub async fn run_query_loop(
                 continue_or_end!(assistant_msg, usage);
             }
             other => {
-                warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
+                warn!(
+                    stop_reason = other,
+                    "Unknown stop reason, treating as end_turn"
+                );
                 fire_stop_hooks!(assistant_msg);
                 if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                     let patch = snap.patch(hash).await;
@@ -2326,7 +2503,10 @@ mod tests {
             ..Default::default()
         };
         let query_config = QueryConfig::from_config(&cfg);
-        assert_eq!(query_config.effort_level, Some(claurst_core::effort::EffortLevel::High));
+        assert_eq!(
+            query_config.effort_level,
+            Some(claurst_core::effort::EffortLevel::High)
+        );
     }
 
     #[test]
@@ -2346,6 +2526,7 @@ mod tests {
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             session_context: None,
+            memory_content: String::new(),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -2380,11 +2561,13 @@ mod tests {
     #[test]
     fn test_parse_tool_args_valid_object() {
         // A complete JSON object parses to the same value.
-        let v = claurst_api::tool_json::parse_tool_input("{\"a\":1}").expect("valid JSON should parse");
+        let v =
+            claurst_api::tool_json::parse_tool_input("{\"a\":1}").expect("valid JSON should parse");
         assert_eq!(v, serde_json::json!({ "a": 1 }));
 
-        let v = claurst_api::tool_json::parse_tool_input("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
-            .expect("valid JSON should parse");
+        let v =
+            claurst_api::tool_json::parse_tool_input("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
+                .expect("valid JSON should parse");
         assert_eq!(v["path"], "/tmp/x");
         assert_eq!(v["content"], "hi");
     }
@@ -2393,9 +2576,18 @@ mod tests {
     fn test_parse_tool_args_empty_is_empty_object() {
         // No-argument tool calls arrive as an empty (or whitespace-only)
         // buffer and must map to `{}` so the happy path still works.
-        assert_eq!(claurst_api::tool_json::parse_tool_input("").unwrap(), serde_json::json!({}));
-        assert_eq!(claurst_api::tool_json::parse_tool_input("   ").unwrap(), serde_json::json!({}));
-        assert_eq!(claurst_api::tool_json::parse_tool_input("\n\t ").unwrap(), serde_json::json!({}));
+        assert_eq!(
+            claurst_api::tool_json::parse_tool_input("").unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            claurst_api::tool_json::parse_tool_input("   ").unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            claurst_api::tool_json::parse_tool_input("\n\t ").unwrap(),
+            serde_json::json!({})
+        );
     }
 
     #[test]
@@ -2418,7 +2610,8 @@ mod tests {
 
         // Regression guard: the failing cases must never resolve to `{}`.
         for bad in ["{\"a\":", "{\"path\": \"/etc/passwd", "{not json}"] {
-            let resolved = claurst_api::tool_json::parse_tool_input(bad).unwrap_or(serde_json::json!({}));
+            let resolved =
+                claurst_api::tool_json::parse_tool_input(bad).unwrap_or(serde_json::json!({}));
             // The OLD buggy behavior turned these into `{}`; assert we now
             // *detect* the error rather than relying on that fallback.
             assert!(
@@ -2441,7 +2634,9 @@ mod tests {
         assert_eq!(blocks.len(), 2, "expected exactly two system blocks");
         for block in &blocks {
             assert!(
-                !block.text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+                !block
+                    .text
+                    .contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
                 "the boundary marker must never be sent to the model"
             );
         }
@@ -2519,7 +2714,10 @@ mod tests {
         cfg.permission_mode = Some(PermissionMode::Plan);
         let (stable_plan, dynamic_plan) = prompt_halves(build_system_prompt(&cfg));
 
-        assert_eq!(stable_default, stable_plan, "the cached block must stay byte-identical");
+        assert_eq!(
+            stable_default, stable_plan,
+            "the cached block must stay byte-identical"
+        );
         assert!(dynamic_default.contains("Current permission mode: `default`"));
         assert!(dynamic_plan.contains("Current permission mode: `plan`"));
         assert!(!dynamic_plan.contains("`default`"));
@@ -2659,8 +2857,7 @@ mod tests {
 
         // Simulate a failed reactive_compact / context_collapse (API error,
         // Cancelled, empty summary all map to Err here).
-        let outcome: Result<compact::CompactResult, ClaudeError> =
-            Err(ClaudeError::Cancelled);
+        let outcome: Result<compact::CompactResult, ClaudeError> = Err(ClaudeError::Cancelled);
         let result = apply_compact_result(&mut messages, outcome);
 
         assert!(result.is_err(), "helper must surface the compaction error");
@@ -2729,6 +2926,7 @@ mod tests {
     //      execute() runs even though the handler would deny;
     //  (c) a ReadOnly / None tool is never gated centrally.
 
+    use std::sync::atomic::AtomicUsize as StdAtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     /// Permission handler that denies everything (returns `Ask`, which in a
@@ -2761,11 +2959,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for MockTool {
-        fn name(&self) -> &str { self.name }
-        fn description(&self) -> &str { "mock tool for backstop tests" }
-        fn permission_level(&self) -> PermissionLevel { self.level }
-        fn self_gates(&self) -> bool { self.self_gates }
-        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "mock tool for backstop tests"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            self.level
+        }
+        fn self_gates(&self) -> bool {
+            self.self_gates
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
             self.ran.store(true, AtomicOrdering::SeqCst);
             ToolResult::success("mock ran")
@@ -2904,7 +3112,10 @@ mod tests {
         let result = execute_tool("MockSafe", &serde_json::json!({}), &tools, &ctx).await;
         assert!(result.is_error);
         assert!(result.content.contains("disallowed"), "{}", result.content);
-        assert!(!ran.load(AtomicOrdering::SeqCst), "a disallowed tool must not run");
+        assert!(
+            !ran.load(AtomicOrdering::SeqCst),
+            "a disallowed tool must not run"
+        );
     }
 
     /// #445: when the user denies a call in a parallel batch with a reason,
@@ -2922,9 +3133,11 @@ mod tests {
             let next = responder_queue.lock().queue.pop_front();
             if let Some(mut pending) = next {
                 if let Some(tx) = pending.decision_tx.take() {
-                    let _ = tx.send(claurst_core::permissions::PermissionDecision::DenyWithFeedback(
-                        "use cargo check instead".to_string(),
-                    ));
+                    let _ = tx.send(
+                        claurst_core::permissions::PermissionDecision::DenyWithFeedback(
+                            "use cargo check instead".to_string(),
+                        ),
+                    );
                 }
                 return pending.request.tool_name;
             }
@@ -2963,14 +3176,19 @@ mod tests {
         assert!(!cancelled);
         assert!(results[0].is_error);
         assert!(
-            results[0].content.contains("The user said: use cargo check instead"),
+            results[0]
+                .content
+                .contains("The user said: use cargo check instead"),
             "{}",
             results[0].content
         );
         assert!(!asked_ran.load(AtomicOrdering::SeqCst));
         assert!(results[1].is_error);
         assert_eq!(results[1].content, claurst_tools::BATCH_REJECTED_MSG);
-        assert!(!later_ran.load(AtomicOrdering::SeqCst), "a call after the denial must not run");
+        assert!(
+            !later_ran.load(AtomicOrdering::SeqCst),
+            "a call after the denial must not run"
+        );
         assert!(ctx.batch_rejection.is_rejected());
 
         // A fresh batch runs normally again.
@@ -3215,6 +3433,50 @@ mod tests {
         }
     }
 
+    #[path = "minimax_tests.rs"]
+    mod minimax_tests;
+
+    #[tokio::test]
+    async fn durable_queue_is_journaled_and_acknowledged_before_model_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = CommandQueue::new();
+        queue.enable_persistence_in(dir.path(), "durable-loop").unwrap();
+        queue.push(QueuedCommand::InjectUserMessage("durable steer".into()), CommandPriority::High);
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: requests.clone(),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
+            always_end_turn: true,
+        }));
+        let mut session = claurst_core::history::ConversationSession::new("mock-model".into());
+        session.id = "durable-loop".into();
+        let journal_dir = dir.path().join("sessions");
+        let journal = claurst_core::session_journal::SessionJournal::new(&journal_dir, &session);
+        let mut config = make_config(None, None);
+        config.model = "mock-model".into();
+        config.provider_registry = Some(Arc::new(registry));
+        config.command_queue = Some(queue.clone());
+        config.session_journal = Some(journal);
+        let mut context = deny_all_context();
+        context.session_id = session.id.clone();
+        context.config.provider = Some("mockprov".into());
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "unused-fixture-key".into(), ..Default::default()
+        }).unwrap();
+        let mut messages = vec![Message::user("start")];
+        let outcome = run_query_loop(&client, &mut messages, &[], &context, &config,
+            claurst_core::cost::CostTracker::new(), None, tokio_util::sync::CancellationToken::new(), None).await;
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(queue.is_empty());
+        assert!(claurst_core::soft_interrupt_store::load_in(dir.path(), "durable-loop").unwrap().is_empty());
+        let loaded = claurst_core::session_journal::load(&journal_dir, &session.id).unwrap().session;
+        assert_eq!(loaded.messages.iter().filter(|message| message.get_all_text() == "durable steer").count(), 1);
+        assert!(loaded.messages.iter().find(|message| message.get_all_text() == "durable steer").unwrap().uuid.is_some());
+    }
+
     fn noop_tools() -> Vec<Box<dyn Tool>> {
         vec![Box::new(MockTool {
             name: "noop_tool",
@@ -3222,6 +3484,221 @@ mod tests {
             self_gates: false,
             ran: Arc::new(AtomicBool::new(false)),
         })]
+    }
+
+    /// Provider that serves the main loop from a scripted stream (always
+    /// `end_turn`) and counts non-stream `create_message` calls — the only
+    /// such calls in these tests are turn-end memory-extraction requests.
+    struct ExtractionProbeProvider {
+        id: claurst_core::provider_id::ProviderId,
+        nonstream_calls: Arc<StdAtomicUsize>,
+        /// System prompts seen by non-stream requests (the extraction route).
+        nonstream_systems: Arc<StdMutex<Vec<Option<SystemPrompt>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for ExtractionProbeProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "extraction-probe"
+        }
+
+        async fn create_message(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            self.nonstream_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.nonstream_systems
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
+            Ok(claurst_api::ProviderResponse {
+                id: uuid::Uuid::new_v4().to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "MEMORY: project_fact | 8 | probe hit".to_string(),
+                }],
+                stop_reason: claurst_api::provider_types::StopReason::EndTurn,
+                usage: UsageInfo::default(),
+                model: "mock-model".to_string(),
+                rate_limits: None,
+            })
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            // Main-loop turns ride this route; record their system prompt so
+            // read-path tests can assert on the prompt the model actually
+            // sees (the non-stream vec above stays extraction-only).
+            self.nonstream_systems
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
+            use claurst_api::provider_types::StopReason;
+            use claurst_api::StreamEvent;
+
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let events: Vec<Result<StreamEvent, claurst_api::ProviderError>> = vec![
+                Ok(StreamEvent::MessageStart {
+                    id: msg_id,
+                    model: "mock-model".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "Done.".to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Some(UsageInfo::default()),
+                }),
+                Ok(StreamEvent::MessageStop),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    fn extraction_fixture(
+        dir: &std::path::Path,
+        session: &str,
+        calls: Arc<StdAtomicUsize>,
+    ) -> session_memory::ExtractionRoute {
+        session_memory::ExtractionRoute {
+            provider_id: "mockprov".to_string(),
+            model_id: "mock-model".to_string(),
+            provider: Some(Arc::new(ExtractionProbeProvider {
+                id: claurst_core::provider_id::ProviderId::new("mockprov"),
+                nonstream_calls: calls,
+                nonstream_systems: Arc::new(StdMutex::new(Vec::new())),
+            })),
+            anthropic_client: claurst_api::AnthropicClient::new(
+                claurst_api::client::ClientConfig {
+                    api_key: "unused-fixture-key".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            store_dir: dir.to_path_buf(),
+            session_id: session.to_string(),
+            snapshot_sequence: session_memory::next_extraction_sequence(),
+        }
+    }
+
+    fn extraction_messages(prefix: &str, count: usize) -> Vec<Message> {
+        (0..count)
+            .map(|index| {
+                let mut message = Message::user(format!("useful fact {index}"));
+                message.uuid = Some(format!("{prefix}-{index}"));
+                message
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn extraction_progress_is_session_scoped_and_rewritten_history_is_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(StdAtomicUsize::new(0));
+        let first = extraction_fixture(dir.path(), "first", calls.clone());
+        session_memory::extract_and_store(&first, &extraction_messages("long", 100), dir.path())
+            .await;
+        let second = extraction_fixture(dir.path(), "second", calls.clone());
+        session_memory::extract_and_store(&second, &extraction_messages("short", 20), dir.path())
+            .await;
+        let rewritten = extraction_fixture(dir.path(), "first", calls.clone());
+        session_memory::extract_and_store(
+            &rewritten,
+            &extraction_messages("rewritten", 20),
+            dir.path(),
+        )
+        .await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+        let first_cursor = claurst_core::memdir::extraction_cursor_path(dir.path(), "first");
+        let second_cursor = claurst_core::memdir::extraction_cursor_path(dir.path(), "second");
+        assert_ne!(first_cursor, second_cursor);
+        assert!(first_cursor.is_file() && second_cursor.is_file());
+    }
+
+    #[tokio::test]
+    async fn concurrent_extractions_recheck_cursor_and_stale_snapshots_cannot_rewind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(StdAtomicUsize::new(0));
+        let older = extraction_fixture(dir.path(), "session", calls.clone());
+        let newer = extraction_fixture(dir.path(), "session", calls.clone());
+        let messages = extraction_messages("history", 30);
+        tokio::join!(
+            session_memory::extract_and_store(&newer, &messages, dir.path()),
+            session_memory::extract_and_store(&newer, &messages, dir.path()),
+        );
+        session_memory::extract_and_store(&older, &messages[..20], dir.path()).await;
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "one request covers the same window"
+        );
+        let cursor: session_memory::ExtractionCursor = serde_json::from_slice(
+            &std::fs::read(claurst_core::memdir::extraction_cursor_path(
+                dir.path(),
+                "session",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cursor.message_count, 30);
+        assert_eq!(cursor.last_uuid.as_deref(), Some("history-29"));
+    }
+
+    #[tokio::test]
+    async fn extraction_storage_failure_retains_window_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto"), "blocks the memory directory").unwrap();
+        let calls = Arc::new(StdAtomicUsize::new(0));
+        let route = extraction_fixture(dir.path(), "session", calls.clone());
+        let messages = extraction_messages("history", 20);
+        assert_eq!(
+            session_memory::extract_and_store(&route, &messages, dir.path()).await,
+            0
+        );
+        assert!(!claurst_core::memdir::extraction_cursor_path(dir.path(), "session").exists());
+        std::fs::remove_file(dir.path().join("auto")).unwrap();
+        assert_eq!(
+            session_memory::extract_and_store(&route, &messages, dir.path()).await,
+            1
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert!(claurst_core::memdir::extraction_cursor_path(dir.path(), "session").is_file());
     }
 
     /// Drive `run_query_loop` against the recording provider. Returns the
@@ -3318,6 +3795,277 @@ mod tests {
         (outcome, recorded, messages)
     }
 
+    /// Drive the loop against `ExtractionProbeProvider` with memory extraction
+    /// enabled and a history long enough to pass `MIN_MESSAGES_TO_EXTRACT`.
+    /// Returns (outcome, non-stream call count, systems seen by those calls).
+    ///
+    /// The registry guard is deliberately held across the awaits below: the
+    /// test must own the process-global spawn registry AND the
+    /// `CLAURST_REMOTE_MEMORY_DIR` env var for its full body, or a sibling
+    /// test's cleanup unsets the env var mid-loop and the store dir silently
+    /// falls back to the real `~/.claurst`.
+    #[allow(clippy::await_holding_lock)]
+    async fn drive_extraction_loop(
+        messages: Vec<Message>,
+        tool_config: claurst_core::config::Config,
+    ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
+        drive_extraction_loop_with(messages, tool_config, None).await
+    }
+
+    /// Same as [`Self::drive_extraction_loop`], but lets the caller pass an
+    /// already-held registry guard so tests that need the store seeded before
+    /// the loop starts (or must keep the env override alive across both the
+    /// seeding and the run) do not re-acquire the non-reentrant mutex.
+    #[allow(clippy::await_holding_lock)]
+    async fn drive_extraction_loop_with(
+        messages: Vec<Message>,
+        tool_config: claurst_core::config::Config,
+        mut registry_guard: Option<session_memory::TestRegistryGuard>,
+    ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
+        // Serialize against every other test that touches the process-global
+        // spawn registry, or this `await` can drain another test's handles
+        // (and vice versa). When the caller already holds the lock, reuse
+        // their guard; they keep owning the env override and store root.
+        let caller_owns_store = registry_guard.is_some();
+        let _registry = match registry_guard.take() {
+            Some(guard) => guard,
+            None => session_memory::test_registry_lock(),
+        };
+        // The store dir resolves through CLAURST_REMOTE_MEMORY_DIR; isolate
+        // it per test so no cursor or entry ever lands in the real ~/.claurst
+        // and no stale cursor from a previous run suppresses extraction. The
+        // guard also owns the tempdir and restores the previous value on
+        // drop, so a panic inside the loop below cannot leak the override
+        // into later tests.
+        //
+        // When the caller passed a registry guard they already own an env
+        // override (and possibly a pre-seeded store); replacing it here would
+        // hide their seeded entries, so keep theirs.
+        let _env_guard = if caller_owns_store {
+            None
+        } else {
+            let store_root = tempfile::tempdir().expect("temp store root");
+            Some(RemoteMemoryDirOverride::set(store_root))
+        };
+        let nonstream_calls = Arc::new(StdAtomicUsize::new(0));
+        let nonstream_systems = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(ExtractionProbeProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            nonstream_calls: nonstream_calls.clone(),
+            nonstream_systems: nonstream_systems.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "extraction-test".to_string();
+        ctx.config = tool_config;
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+
+        let cost = claurst_core::cost::CostTracker::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut messages = messages;
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &[],
+                &ctx,
+                &config,
+                cost,
+                None,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        // The spawn is tracked; drain it so the extraction completes before
+        // the assertions read the probe counters.
+        let unfinished =
+            session_memory::await_pending_extractions(std::time::Duration::from_secs(5)).await;
+        assert_eq!(unfinished, 0, "extraction task must finish within budget");
+
+        let calls = nonstream_calls.load(AtomicOrdering::SeqCst);
+        let systems = nonstream_systems.lock().unwrap().clone();
+        (outcome, calls, systems)
+    }
+
+    /// Points `CLAURST_REMOTE_MEMORY_DIR` at `dir` for its lifetime and
+    /// restores the previous value on drop, so a failing test cannot leak
+    /// the override into the rest of the process. Tests using this must
+    /// hold `session_memory::test_registry_lock()` first: the env var is
+    /// process-global and the lock serializes its readers in this binary.
+    struct RemoteMemoryDirOverride {
+        saved: Option<std::ffi::OsString>,
+        // Owned so the tempdir outlives every store write that resolves
+        // through the override, including detached extraction tasks that
+        // are still draining when the test body ends.
+        _dir: tempfile::TempDir,
+    }
+
+    impl RemoteMemoryDirOverride {
+        fn set(_dir: tempfile::TempDir) -> Self {
+            let saved = std::env::var_os("CLAURST_REMOTE_MEMORY_DIR");
+            std::env::set_var("CLAURST_REMOTE_MEMORY_DIR", _dir.path());
+            Self { saved, _dir }
+        }
+    }
+
+    impl Drop for RemoteMemoryDirOverride {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_REMOTE_MEMORY_DIR", v),
+                None => std::env::remove_var("CLAURST_REMOTE_MEMORY_DIR"),
+            }
+        }
+    }
+
+    /// (extraction) Provider-dispatch end-turn fires exactly one extraction
+    /// request through the ACTIVE provider, carrying the extraction system
+    /// prompt. Regression for the bug where the hook was legacy-path-only.
+    #[tokio::test]
+    async fn provider_dispatch_end_turn_fires_memory_extraction() {
+        // 25 messages: above MIN_MESSAGES_TO_EXTRACT (20).
+        let mut messages = vec![Message::user("start")];
+        for i in 0..24 {
+            messages.push(if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("reply {i}"))
+            });
+        }
+        let tool_config = claurst_core::config::Config {
+            memory_extraction_enabled: true,
+            ..Default::default()
+        };
+
+        let (outcome, calls, systems) = drive_extraction_loop(messages, tool_config).await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "loop must end normally"
+        );
+        assert_eq!(
+            calls, 1,
+            "exactly one extraction request must fire at end_turn"
+        );
+        // Two recorded prompts now: the main-loop turn (stream route) plus
+        // the extraction request (non-stream route). The extraction prompt
+        // is the last one recorded.
+        assert_eq!(systems.len(), 2);
+        match systems.last() {
+            Some(Some(SystemPrompt::Text(text))) => {
+                assert!(
+                    text.contains("memory extraction assistant"),
+                    "extraction request must carry the extraction system prompt"
+                );
+            }
+            other => panic!("expected extraction system prompt, got {other:?}"),
+        }
+    }
+
+    /// (read path) The memory index written to the store by extraction (or a
+    /// prior session) reaches the next turn's system prompt: the loop
+    /// refreshes `memory_content` from `memory_store_dir` every turn and
+    /// `build_system_prompt` places it in the dynamic `<memory>` block.
+    /// Regression for the period where the read path had zero callers and
+    /// extracted facts could never surface in a prompt.
+    #[tokio::test]
+    async fn stored_memory_index_reaches_system_prompt() {
+        // Serialize against every other test that touches the process-global
+        // spawn registry or the CLAURST_REMOTE_MEMORY_DIR override. The guard
+        // is handed to the loop driver below: re-acquiring it there would
+        // self-deadlock (the mutex is not reentrant and the runtime is
+        // current-thread).
+        let registry_guard = session_memory::test_registry_lock();
+        let store_root = tempfile::tempdir().expect("temp store root");
+        let _env_guard = RemoteMemoryDirOverride::set(store_root);
+
+        // Pre-seed the store exactly as `append_auto_memories` would: an
+        // `auto/` topic file plus a MEMORY.md index line for it.
+        let tool_config = claurst_core::config::Config::default();
+        // `deny_all_context` pins working_dir to `/workspace`, so the loop
+        // resolves the store through the same `memory_store_dir` call this
+        // seeding uses; the hash key makes the path deterministic.
+        let store_dir = claurst_core::memdir::memory_store_dir(std::path::Path::new("/workspace"));
+        let entry = claurst_core::memdir::AutoMemoryEntry {
+            name: "build command".to_string(),
+            description: "how to build the workspace".to_string(),
+            content: "cargo build --workspace from src-rust".to_string(),
+            memory_type: claurst_core::memdir::MemoryType::Project,
+        };
+        let written = claurst_core::memdir::append_auto_memories(&store_dir, &[entry]).expect("store memory");
+        assert_eq!(written.len(), 1, "seed entry must land in the store");
+
+        // Drive one turn through the provider-dispatch path with auto-memory
+        // enabled (default) and assert the request's system prompt carries the
+        // index line inside the <memory> block.
+        let messages = vec![Message::user("what is the build command?")];
+        let mut tool_config = tool_config;
+        tool_config.provider = Some("mockprov".to_string());
+        let (outcome, calls, systems) =
+            drive_extraction_loop_with(messages, tool_config, Some(registry_guard)).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(calls, 0, "history below threshold: no extraction request");
+        assert_eq!(systems.len(), 1);
+        match &systems[0] {
+            Some(SystemPrompt::Blocks(blocks)) => {
+                let dynamic = blocks
+                    .iter()
+                    .map(|b| b.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    dynamic.contains("<memory>"),
+                    "dynamic block must carry the memory section"
+                );
+                assert!(
+                    dynamic.contains("Memory Index (MEMORY.md)"),
+                    "dynamic block must carry the index heading"
+                );
+                assert!(
+                    dynamic.contains("build command") || dynamic.contains("build-command"),
+                    "index line for the seeded entry must reach the prompt"
+                );
+            }
+            other => panic!("expected block system prompt, got {other:?}"),
+        }
+    }
+
+    /// (extraction) The gate stays closed when `memoryExtractionEnabled` is
+    /// unset: no second request, even with a long history.
+    #[tokio::test]
+    async fn provider_dispatch_extraction_off_by_default() {
+        let mut messages = vec![Message::user("start")];
+        for i in 0..24 {
+            messages.push(if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("reply {i}"))
+            });
+        }
+        let (outcome, calls, _systems) =
+            drive_extraction_loop(messages, claurst_core::config::Config::default()).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(calls, 0, "no extraction request when the gate is off");
+    }
+
     /// Issue #440: across a scripted multi-turn run the stable system block is
     /// byte-identical on every request and never carries the boundary marker,
     /// while per-session and per-turn content stays in the dynamic block.
@@ -3380,8 +4128,14 @@ mod tests {
         assert_eq!(stable, &halves[1].0, "stable block changed between turns");
         assert!(stable.contains("Project rules."));
         for volatile in ["# Git Status", "maximally concise", "Appended."] {
-            assert!(!stable.contains(volatile), "{volatile:?} leaked into the stable block");
-            assert!(dynamic.contains(volatile), "{volatile:?} missing from the dynamic block");
+            assert!(
+                !stable.contains(volatile),
+                "{volatile:?} leaked into the stable block"
+            );
+            assert!(
+                dynamic.contains(volatile),
+                "{volatile:?} missing from the dynamic block"
+            );
         }
     }
 
@@ -3741,7 +4495,10 @@ mod tests {
             Message::user("now just tidy the docs"),
         ];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
-        assert!(prompt.is_none(), "persona should not persist to a plain turn");
+        assert!(
+            prompt.is_none(),
+            "persona should not persist to a plain turn"
+        );
     }
 
     #[test]
@@ -3800,6 +4557,7 @@ mod tests {
         id: claurst_core::provider_id::ProviderId,
         steps: StdMutex<std::collections::VecDeque<ScriptStep>>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<StdMutex<Vec<claurst_api::ProviderRequest>>>,
     }
 
     fn text_turn(text: &str) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
@@ -3811,7 +4569,10 @@ mod tests {
                 model: "mock-model".to_string(),
                 usage: UsageInfo::default(),
             }),
-            Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: text.to_string(),
+            }),
             Ok(StreamEvent::MessageDelta {
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Some(UsageInfo::default()),
@@ -3838,7 +4599,7 @@ mod tests {
 
         async fn create_message_stream(
             &self,
-            _request: claurst_api::ProviderRequest,
+            request: claurst_api::ProviderRequest,
         ) -> Result<
             std::pin::Pin<
                 Box<
@@ -3849,6 +4610,7 @@ mod tests {
             >,
             claurst_api::ProviderError,
         > {
+            self.requests.lock().unwrap().push(request);
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let step = self.steps.lock().unwrap().pop_front();
             let events = match step {
@@ -3886,6 +4648,7 @@ mod tests {
         calls: usize,
         events: Vec<QueryEvent>,
         messages: Vec<Message>,
+        requests: Vec<claurst_api::ProviderRequest>,
     }
 
     /// Drive `run_query_loop` against a `ScriptedProvider` with a fast retry
@@ -3910,10 +4673,12 @@ mod tests {
         command_queue: Option<CommandQueue>,
     ) -> ScriptedRun {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(ScriptedProvider {
             id: claurst_core::provider_id::ProviderId::new("scriptprov"),
             steps: StdMutex::new(steps.into()),
             calls: calls.clone(),
+            requests: requests.clone(),
         });
         let mut registry = claurst_api::ProviderRegistry::new();
         registry.register(provider);
@@ -3964,7 +4729,9 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
+        let requests = requests.lock().unwrap().clone();
         ScriptedRun {
+            requests,
             outcome,
             calls: calls.load(std::sync::atomic::Ordering::SeqCst),
             events,
@@ -3998,7 +4765,9 @@ mod tests {
             run.events
         );
         assert!(
-            run.messages.iter().any(|m| m.get_all_text().contains("final answer")),
+            run.messages
+                .iter()
+                .any(|m| m.get_all_text().contains("final answer")),
             "the retried response must land in the history"
         );
     }
@@ -4011,7 +4780,10 @@ mod tests {
             &pid_scripted(),
         );
         let run = drive_scripted(vec![ScriptStep::Fail(auth)], 5, noop_tools()).await;
-        assert!(matches!(run.outcome, QueryOutcome::Error(_)), "401 must surface an error");
+        assert!(
+            matches!(run.outcome, QueryOutcome::Error(_)),
+            "401 must surface an error"
+        );
         assert_eq!(run.calls, 1, "401 must not be retried");
     }
 
@@ -4040,7 +4812,9 @@ mod tests {
 
     #[tokio::test]
     async fn retry_budget_exhaustion_surfaces_an_error() {
-        let steps = (0..3).map(|_| ScriptStep::Fail(server_error(502))).collect();
+        let steps = (0..3)
+            .map(|_| ScriptStep::Fail(server_error(502)))
+            .collect();
         let run = drive_scripted(steps, 2, noop_tools()).await;
         assert!(
             matches!(run.outcome, QueryOutcome::Error(_)),
@@ -4062,7 +4836,9 @@ mod tests {
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
         assert_eq!(run.calls, 2);
         assert!(
-            !run.messages.iter().any(|m| m.get_all_text().contains("partial")),
+            !run.messages
+                .iter()
+                .any(|m| m.get_all_text().contains("partial")),
             "output from the failed attempt must not be kept"
         );
     }
@@ -4075,7 +4851,9 @@ mod tests {
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
         assert_eq!(run.calls, 2, "a truncated stream must be retried");
         assert!(
-            !run.messages.iter().any(|m| m.get_all_text().contains("half an ans")),
+            !run.messages
+                .iter()
+                .any(|m| m.get_all_text().contains("half an ans")),
             "the truncated attempt must not be kept as a finished turn"
         );
     }
@@ -4092,7 +4870,9 @@ mod tests {
     }
 
     /// A tool-use turn whose argument JSON is `args`, then `end_turn`.
-    fn tool_call_turn(args: &str) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
+    fn tool_call_turn(
+        args: &str,
+    ) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
         use claurst_api::provider_types::StopReason;
         use claurst_api::StreamEvent;
         vec![
@@ -4110,7 +4890,10 @@ mod tests {
                     thought_signature: None,
                 },
             }),
-            Ok(StreamEvent::InputJsonDelta { index: 1, partial_json: args.to_string() }),
+            Ok(StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: args.to_string(),
+            }),
             Ok(StreamEvent::ContentBlockStop { index: 1 }),
             Ok(StreamEvent::MessageDelta {
                 stop_reason: Some(StopReason::ToolUse),
@@ -4133,16 +4916,22 @@ mod tests {
 
     fn tool_result_for(messages: &[Message], id: &str) -> Option<(String, bool)> {
         messages.iter().find_map(|m| match &m.content {
-            claurst_core::types::MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, content, is_error } if tool_use_id == id => {
-                    let text = match content {
-                        ToolResultContent::Text(t) => t.clone(),
-                        other => format!("{other:?}"),
-                    };
-                    Some((text, is_error.unwrap_or(false)))
-                }
-                _ => None,
-            }),
+            claurst_core::types::MessageContent::Blocks(blocks) => {
+                blocks.iter().find_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } if tool_use_id == id => {
+                        let text = match content {
+                            ToolResultContent::Text(t) => t.clone(),
+                            other => format!("{other:?}"),
+                        };
+                        Some((text, is_error.unwrap_or(false)))
+                    }
+                    _ => None,
+                })
+            }
             _ => None,
         })
     }
@@ -4157,7 +4946,10 @@ mod tests {
         )
         .await;
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
-        assert!(ran.load(AtomicOrdering::SeqCst), "repaired arguments must run the tool");
+        assert!(
+            ran.load(AtomicOrdering::SeqCst),
+            "repaired arguments must run the tool"
+        );
         let (_, is_error) = tool_result_for(&run.messages, "call-1").expect("tool result");
         assert!(!is_error);
     }
@@ -4172,7 +4964,10 @@ mod tests {
         )
         .await;
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
-        assert!(!ran.load(AtomicOrdering::SeqCst), "the tool must not run with `{{}}`");
+        assert!(
+            !ran.load(AtomicOrdering::SeqCst),
+            "the tool must not run with `{{}}`"
+        );
         let (text, is_error) = tool_result_for(&run.messages, "call-1").expect("tool result");
         assert!(is_error);
         assert!(
@@ -4204,6 +4999,307 @@ mod tests {
             .filter(|m| m.get_all_text() == MAX_STEPS_DEGRADATION_MSG)
             .count();
         assert_eq!(prompts, 1, "summary prompt must appear exactly once");
+    }
+
+    /// A completed Responses item replaces its streaming placeholder, while
+    /// distinct reasoning, calls and text remain in wire order through the real
+    /// query loop, the next request, and save/load before replay.
+    #[tokio::test]
+    async fn responses_reasoning_replays_in_order_after_query_and_persistence() {
+        use claurst_api::StreamEvent;
+        use claurst_core::types::ResponsesReasoningProvider;
+        let reasoning = |id: &str, summary: &str, data: &str| ContentBlock::ResponsesReasoning {
+            provider: ResponsesReasoningProvider::Codex,
+            item_id: Some(id.into()),
+            summary: summary.into(),
+            encrypted_content: Some(data.into()),
+        };
+        let events = vec![
+            Ok(StreamEvent::MessageStart {
+                id: "msg_reasoning".into(),
+                model: "mock-model".into(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+            }),
+            Ok(StreamEvent::ThinkingDelta {
+                index: 0,
+                thinking: "first".into(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: reasoning("rs_0", "first", "ENC-0"),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "noop_tool".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                },
+            }),
+            Ok(StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: "{}".into(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 2,
+                content_block: reasoning("rs_2", "second", "ENC-2"),
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 3,
+                text: "checking".into(),
+            }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(claurst_api::StopReason::ToolUse),
+                usage: None,
+            }),
+            Ok(StreamEvent::MessageStop),
+        ];
+        let run = drive_scripted(vec![ScriptStep::Stream(events)], 0, noop_tools()).await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.requests.len(), 2);
+        let saved: Vec<Message> =
+            serde_json::from_str(&serde_json::to_string(&run.messages).unwrap()).unwrap();
+        let blocks = saved[1].content_blocks();
+        assert_eq!(blocks.len(), 4);
+        assert!(
+            matches!(&blocks[0], ContentBlock::ResponsesReasoning { item_id: Some(id), summary, encrypted_content: Some(data), .. } if id == "rs_0" && summary == "first" && data == "ENC-0")
+        );
+        assert!(matches!(&blocks[1], ContentBlock::ToolUse { id, .. } if id == "call-1"));
+        assert!(
+            matches!(&blocks[2], ContentBlock::ResponsesReasoning { item_id: Some(id), .. } if id == "rs_2")
+        );
+        assert!(matches!(&blocks[3], ContentBlock::Text { text } if text == "checking"));
+        assert_eq!(
+            serde_json::to_value(&run.requests[1].messages[1]).unwrap(),
+            serde_json::to_value(&saved[1]).unwrap()
+        );
+        let mut replay = run.requests[1].clone();
+        replay.messages = saved;
+        replay.system_prompt = None;
+        let input = claurst_api::providers::CopilotProvider::to_responses_input_pub(&replay);
+        let types: Vec<_> = input
+            .iter()
+            .map(|item| item["type"].as_str().or(item["role"].as_str()).unwrap())
+            .collect();
+        assert_eq!(
+            &types[..5],
+            &[
+                "user",
+                "reasoning",
+                "function_call",
+                "reasoning",
+                "assistant"
+            ]
+        );
+        assert_eq!(input[1]["id"], "rs_0");
+        assert_eq!(input[1]["encrypted_content"], "ENC-0");
+        assert_eq!(input[3]["id"], "rs_2");
+        assert_eq!(input[3]["encrypted_content"], "ENC-2");
+        let native = claurst_api::normalize_anthropic_messages(&replay.messages);
+        let native_blocks = native[1].content_blocks();
+        assert_eq!(native_blocks.len(), 2);
+        assert!(matches!(&native_blocks[0], ContentBlock::ToolUse { .. }));
+        assert!(matches!(&native_blocks[1], ContentBlock::Text { .. }));
+    }
+
+    // ---- schema-rejection recovery (claurst-schema-dialect) ----------------
+
+    /// Serializes tests that mutate process env. The schema-recovery test
+    /// redirects the quirk store and the auth store via env vars, which are
+    /// process-global while tests run in parallel.
+    static SCHEMA_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Saves and clears the env keys the schema-recovery test needs, restoring
+    /// them on drop.
+    struct SchemaEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SchemaEnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for SchemaEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// A 400-class rejection naming a JSON Schema keyword, shaped like what
+    /// `parse_error_response` produces for an OpenAI-wire provider.
+    fn schema_rejection() -> claurst_api::ProviderError {
+        claurst_api::parse_error_response(
+            400,
+            r#"{"error":{"message":"'uniqueItems' is not permitted","type":"invalid_request_error"}}"#,
+            &claurst_core::provider_id::ProviderId::new("azure"),
+        )
+    }
+
+    /// Drive the loop against a scripted provider registered under a real
+    /// provider id ("azure" speaks the OpenAI wire dialect, so `recover_schema!`
+    /// sees a dialect-mapped route, while route resolution has no real azure
+    /// credentials to prefer over the scripted double).
+    async fn drive_schema_scripted(steps: Vec<ScriptStep>, max_retries: u32) -> ScriptedRun {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(ScriptedProvider {
+            id: claurst_core::provider_id::ProviderId::new("azure"),
+            steps: StdMutex::new(steps.into()),
+            calls: calls.clone(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "schema-recovery-test".to_string();
+        ctx.config.provider = Some("azure".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+        config.retry = claurst_api::RetryConfig {
+            max_retries,
+            initial_delay: std::time::Duration::from_millis(1),
+            ..claurst_api::RetryConfig::default()
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("start")];
+        let mut pending = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                Some(tx),
+                tokio_util::sync::CancellationToken::new(),
+                Some(&mut pending),
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        ScriptedRun {
+            outcome,
+            calls: calls.load(std::sync::atomic::Ordering::SeqCst),
+            events,
+            requests: Vec::new(),
+            messages,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    // SCHEMA_ENV_LOCK must stay held across the scripted run below: the env
+    // vars it protects are process-global and other parallel tests would
+    // observe them mid-run. tokio::test runs single-threaded, so the sync
+    // mutex can never actually contend here.
+    async fn schema_recovery_retries_the_turn_and_refreshes_transient_budgets() {
+        // Route resolution prefers auth-store providers, and the quirk store
+        // defaults to the developer's real file, so both must be redirected
+        // for the duration of this test.
+        let _env_lock = SCHEMA_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let quirks_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let _guard = SchemaEnvGuard::new(&[
+            "CLAURST_SCHEMA_QUIRKS_PATH",
+            "CLAURST_HOME",
+            "AZURE_API_KEY",
+            "AZURE_RESOURCE_NAME",
+        ]);
+        std::env::set_var(
+            "CLAURST_SCHEMA_QUIRKS_PATH",
+            quirks_dir.path().join("quirks.json"),
+        );
+        std::env::set_var("CLAURST_HOME", home_dir.path());
+
+        // The single transient retry is spent on a 503; the fresh request then
+        // hits a schema rejection naming `uniqueItems`, which recovers the
+        // turn. The request after the recovery gets another 503: it must be
+        // retried again, because the schema recovery refreshed the transient
+        // budget along with the turn.
+        let run = drive_schema_scripted(
+            vec![
+                ScriptStep::Fail(server_error(503)),
+                ScriptStep::Fail(schema_rejection()),
+                ScriptStep::Fail(server_error(503)),
+            ],
+            1,
+        )
+        .await;
+        assert!(
+            matches!(run.outcome, QueryOutcome::EndTurn { .. }),
+            "both recoveries must chain, not fail the run: {:?}",
+            run.outcome
+        );
+        // 503 retry, schema-recovery retry, post-recovery 503 retry, final.
+        assert_eq!(run.calls, 4, "every recovery must restart the request");
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    QueryEvent::Retry {
+                        attempt: 1,
+                        max_attempts: 1,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "the transient budget must be full again after schema recovery: {:?}",
+            run.events
+        );
+        assert!(
+            run.messages
+                .iter()
+                .any(|m| m.get_all_text().contains("final answer")),
+            "the recovered turn must complete normally"
+        );
+        // The learned keyword must live in the redirected store, never the
+        // developer's real one.
+        let store = std::fs::read_to_string(quirks_dir.path().join("quirks.json"))
+            .expect("the learned quirk must be persisted");
+        assert!(
+            store.contains("uniqueItems"),
+            "the learned keyword must be recorded: {store}"
+        );
     }
 
     // ---- Issue #441: compaction check points --------------------------------
@@ -4239,7 +5335,10 @@ mod tests {
                 model: "mock-model".to_string(),
                 usage: UsageInfo::default(),
             }),
-            Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: text.to_string(),
+            }),
             Ok(StreamEvent::MessageDelta {
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Some(UsageInfo::default()),
@@ -4293,9 +5392,19 @@ mod tests {
                 .first()
                 .is_some_and(|m| m.get_all_text().contains("<compact-summary>"));
             self.log.lock().unwrap().push(
-                if compacted { "main:compacted" } else { "main:plain" }.to_string(),
+                if compacted {
+                    "main:compacted"
+                } else {
+                    "main:plain"
+                }
+                .to_string(),
             );
-            let step = self.script.lock().unwrap().pop_front().unwrap_or(MainStep::Reply);
+            let step = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MainStep::Reply);
             match step {
                 MainStep::Overflow => Err(claurst_api::ProviderError::ContextOverflow {
                     provider: self.id.clone(),
@@ -4334,7 +5443,11 @@ mod tests {
         (0..count)
             .map(|i| {
                 let text = format!("turn {} {}", i, "x".repeat(size));
-                if i % 2 == 0 { Message::user(text) } else { Message::assistant(text) }
+                if i % 2 == 0 {
+                    Message::user(text)
+                } else {
+                    Message::assistant(text)
+                }
             })
             .collect()
     }
@@ -4416,7 +5529,11 @@ mod tests {
         assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
         assert_eq!(log, vec!["summary", "main:compacted"]);
         assert!(msgs[0].get_all_text().contains("Earlier work, condensed."));
-        assert!(msgs.len() < 11, "history must shrink, got {} messages", msgs.len());
+        assert!(
+            msgs.len() < 11,
+            "history must shrink, got {} messages",
+            msgs.len()
+        );
     }
 
     #[tokio::test]
@@ -4448,7 +5565,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }), "{:?}", outcome);
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "{:?}",
+            outcome
+        );
         assert_eq!(log, vec!["main:plain", "summary", "main:compacted"]);
         assert!(msgs[0].get_all_text().contains("<compact-summary>"));
     }
@@ -4469,12 +5590,8 @@ mod tests {
 
     #[tokio::test]
     async fn overflow_with_auto_compact_disabled_surfaces_the_error() {
-        let (outcome, log, _msgs) = drive_compaction_loop(
-            long_history(7, 20_000),
-            vec![MainStep::Overflow],
-            false,
-        )
-        .await;
+        let (outcome, log, _msgs) =
+            drive_compaction_loop(long_history(7, 20_000), vec![MainStep::Overflow], false).await;
 
         assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
         assert_eq!(log, vec!["main:plain"]);
@@ -4488,10 +5605,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for BigOutputTool {
-        fn name(&self) -> &str { "noop_tool" }
-        fn description(&self) -> &str { "emits oversized output" }
-        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
-        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            "noop_tool"
+        }
+        fn description(&self) -> &str {
+            "emits oversized output"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
             ToolResult::success(format!("FIRST LINE\n{}\nLAST LINE", "y".repeat(200_000)))
         }
@@ -4516,14 +5641,21 @@ mod tests {
                 _ => &[],
             })
             .find_map(|b| match b {
-                ContentBlock::ToolResult { content: ToolResultContent::Text(t), .. } => Some(t),
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Text(t),
+                    ..
+                } => Some(t),
                 _ => None,
             })
             .expect("tool result in history");
         assert!(result.starts_with("FIRST LINE"));
         assert!(result.ends_with("LAST LINE"));
         assert!(result.contains("bytes omitted from the middle"));
-        assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES + 100, "{}", result.len());
+        assert!(
+            result.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES + 100,
+            "{}",
+            result.len()
+        );
     }
 
     // ---- Issue #449: per-step session persistence ---------------------------
@@ -4538,10 +5670,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for JournalProbeTool {
-        fn name(&self) -> &str { "noop_tool" }
-        fn description(&self) -> &str { "reads the session journal" }
-        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
-        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            "noop_tool"
+        }
+        fn description(&self) -> &str {
+            "reads the session journal"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
             let persisted = claurst_core::session_journal::load(&self.dir, &self.session_id)
                 .map(|loaded| loaded.session.messages.len())
@@ -4613,7 +5753,12 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [2, 4]);
         let loaded = claurst_core::session_journal::load(dir.path(), &session.id).unwrap();
         assert!(loaded.rebuilt, "no snapshot was written by the loop");
-        let persisted: Vec<String> = loaded.session.messages.iter().map(|m| m.get_all_text()).collect();
+        let persisted: Vec<String> = loaded
+            .session
+            .messages
+            .iter()
+            .map(|m| m.get_all_text())
+            .collect();
         let live: Vec<String> = messages.iter().map(|m| m.get_all_text()).collect();
         assert_eq!(persisted, live);
     }
@@ -4629,13 +5774,9 @@ mod tests {
         let history = long_history(11, 30_000);
         let first = history[0].get_all_text();
 
-        let (outcome, log, msgs) = drive_journaled_compaction_loop(
-            history,
-            vec![MainStep::Reply],
-            true,
-            Some(journal),
-        )
-        .await;
+        let (outcome, log, msgs) =
+            drive_journaled_compaction_loop(history, vec![MainStep::Reply], true, Some(journal))
+                .await;
         assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
         assert_eq!(log, vec!["summary", "main:compacted"]);
 
@@ -4643,12 +5784,17 @@ mod tests {
             .unwrap()
             .session;
         assert_eq!(resumed.messages.len(), msgs.len());
-        assert!(resumed.messages[0].get_all_text().contains("Earlier work, condensed."));
+        assert!(resumed.messages[0]
+            .get_all_text()
+            .contains("Earlier work, condensed."));
         assert_eq!(resumed.compactions.len(), 1);
         let replaced = &resumed.compactions[0].replaced;
         assert_eq!(replaced.len(), resumed.compactions[0].replaced_len());
         assert_eq!(replaced[0].get_all_text(), first);
-        assert_eq!(resumed.rewind_timeline().count(), replaced.len() + msgs.len());
+        assert_eq!(
+            resumed.rewind_timeline().count(),
+            replaced.len() + msgs.len()
+        );
     }
 
     /// #439 x #441: a context-window error compacts once and retries; it is
@@ -4675,14 +5821,23 @@ mod tests {
         )
         .await;
         assert_eq!(run.calls, 3, "overflow, summary, retried request");
-        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }), "{:?}", run.events);
         assert!(
-            !run.events.iter().any(|e| matches!(e, QueryEvent::Retry { .. })),
+            matches!(run.outcome, QueryOutcome::EndTurn { .. }),
+            "{:?}",
+            run.events
+        );
+        assert!(
+            !run.events
+                .iter()
+                .any(|e| matches!(e, QueryEvent::Retry { .. })),
             "an overflow must not be reported as a transient retry: {:?}",
             run.events
         );
         assert_eq!(
-            run.events.iter().filter(|e| matches!(e, QueryEvent::Compacted(_))).count(),
+            run.events
+                .iter()
+                .filter(|e| matches!(e, QueryEvent::Compacted(_)))
+                .count(),
             1,
             "exactly one compaction: {:?}",
             run.events
@@ -4700,10 +5855,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for SteerWhileRunningTool {
-        fn name(&self) -> &str { "noop_tool" }
-        fn description(&self) -> &str { "pushes steers while running" }
-        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
-        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            "noop_tool"
+        }
+        fn description(&self) -> &str {
+            "pushes steers while running"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
             for steer in &self.steers {
                 self.queue.push(
@@ -4716,7 +5879,10 @@ mod tests {
     }
 
     fn texts_of(messages: &[Message]) -> Vec<(Role, String)> {
-        messages.iter().map(|m| (m.role.clone(), m.get_all_text())).collect()
+        messages
+            .iter()
+            .map(|m| (m.role.clone(), m.get_all_text()))
+            .collect()
     }
 
     #[tokio::test]
@@ -4737,7 +5903,10 @@ mod tests {
         )
         .await;
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
-        assert_eq!(run.calls, 2, "the steers ride the request after the tool batch");
+        assert_eq!(
+            run.calls, 2,
+            "the steers ride the request after the tool batch"
+        );
         assert!(queue.is_empty(), "the step boundary drained the queue");
 
         let history = texts_of(&run.messages);
@@ -4754,7 +5923,10 @@ mod tests {
             ],
             "steers follow the tool results in the order typed: {history:?}"
         );
-        assert_eq!(history.last().map(|(role, _)| role.clone()), Some(Role::Assistant));
+        assert_eq!(
+            history.last().map(|(role, _)| role.clone()),
+            Some(Role::Assistant)
+        );
 
         let injected: Vec<&Vec<String>> = run
             .events
@@ -4766,7 +5938,10 @@ mod tests {
             .collect();
         assert_eq!(
             injected,
-            [&vec!["also check the docs".to_string(), "and the tests".to_string()]]
+            [&vec![
+                "also check the docs".to_string(),
+                "and the tests".to_string()
+            ]]
         );
     }
 
@@ -4797,7 +5972,10 @@ mod tests {
         assert!(queue.is_empty());
         let history = texts_of(&run.messages);
         assert_eq!(history[2].0, Role::User);
-        assert!(history[2].1.starts_with("<background-shell "), "{history:?}");
+        assert!(
+            history[2].1.starts_with("<background-shell "),
+            "{history:?}"
+        );
         assert_eq!(history[3], (Role::Assistant, "final answer".to_string()));
     }
 
@@ -4815,8 +5993,14 @@ mod tests {
         )
         .await;
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
-        assert!(!run.events.iter().any(|e| matches!(e, QueryEvent::InputInjected(_))));
-        assert_eq!(run.messages.iter().filter(|m| m.role == Role::User).count(), 2);
+        assert!(!run
+            .events
+            .iter()
+            .any(|e| matches!(e, QueryEvent::InputInjected(_))));
+        assert_eq!(
+            run.messages.iter().filter(|m| m.role == Role::User).count(),
+            2
+        );
     }
 }
 
@@ -4878,7 +6062,12 @@ mod hook_loop_tests {
             use claurst_api::StreamEvent;
 
             *self.requests.lock().unwrap() += 1;
-            let step = self.steps.lock().unwrap().pop_front().unwrap_or(Step::Text("done"));
+            let step = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Step::Text("done"));
             let start = Ok(StreamEvent::MessageStart {
                 id: uuid::Uuid::new_v4().to_string(),
                 model: "mock-model".to_string(),
@@ -4896,7 +6085,10 @@ mod hook_loop_tests {
                             thought_signature: None,
                         },
                     }),
-                    Ok(StreamEvent::InputJsonDelta { index: 0, partial_json: input.to_string() }),
+                    Ok(StreamEvent::InputJsonDelta {
+                        index: 0,
+                        partial_json: input.to_string(),
+                    }),
                     Ok(StreamEvent::MessageDelta {
                         stop_reason: Some(StopReason::ToolUse),
                         usage: Some(UsageInfo::default()),
@@ -4905,7 +6097,10 @@ mod hook_loop_tests {
                 ],
                 Step::Text(text) => vec![
                     start,
-                    Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+                    Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: text.to_string(),
+                    }),
                     Ok(StreamEvent::MessageDelta {
                         stop_reason: Some(StopReason::EndTurn),
                         usage: Some(UsageInfo::default()),
@@ -4965,7 +6160,10 @@ mod hook_loop_tests {
             self.inputs.lock().unwrap().push(input);
             if let Some(nested) = self.nested {
                 let allowed = ctx.check_permission(nested, "nested call", false).is_ok();
-                self.inputs.lock().unwrap().push(serde_json::json!({ "nested_allowed": allowed }));
+                self.inputs
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::json!({ "nested_allowed": allowed }));
             }
             ToolResult::success("rec ran")
         }
@@ -4985,7 +6183,12 @@ mod hook_loop_tests {
     fn on(hooks: &mut HookMap, event: HookEvent, matcher: Option<&str>, command: String) {
         hooks.entry(event).or_default().push(HookMatcher {
             matcher: matcher.map(str::to_string),
-            hooks: vec![HookCommand { kind: HookType::Command, command, timeout: Some(10), plugin: None }],
+            hooks: vec![HookCommand {
+                kind: HookType::Command,
+                command,
+                timeout: Some(10),
+                plugin: None,
+            }],
         });
     }
 
@@ -5008,9 +6211,17 @@ mod hook_loop_tests {
         history: String,
         tool_inputs: Vec<Value>,
         requests: usize,
+        messages: Vec<Message>,
+        persisted: Vec<Message>,
+        events: Vec<QueryEvent>,
     }
 
-    async fn drive(hooks: HookMap, steps: Vec<Step>, permission: PermissionDecision, is_subagent: bool) -> Run {
+    async fn drive(
+        hooks: HookMap,
+        steps: Vec<Step>,
+        permission: PermissionDecision,
+        is_subagent: bool,
+    ) -> Run {
         drive_nested(hooks, steps, permission, is_subagent, None).await
     }
 
@@ -5021,6 +6232,18 @@ mod hook_loop_tests {
         is_subagent: bool,
         nested: Option<&'static str>,
     ) -> Run {
+        drive_with_client(hooks, steps, permission, is_subagent, nested, None).await
+    }
+
+    async fn drive_with_client(
+        hooks: HookMap,
+        steps: Vec<Step>,
+        permission: PermissionDecision,
+        is_subagent: bool,
+        nested: Option<&'static str>,
+        raw_client: Option<claurst_api::AnthropicClient>,
+    ) -> Run {
+        let raw_anthropic = raw_client.is_some();
         let requests = Arc::new(StdMutex::new(0));
         let provider = Arc::new(ScriptedProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
@@ -5030,20 +6253,28 @@ mod hook_loop_tests {
         let mut registry = claurst_api::ProviderRegistry::new();
         registry.register(provider);
 
-        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
-            api_key: "test-key".to_string(),
-            ..Default::default()
-        })
-        .expect("build test client");
+        let client = raw_client.unwrap_or_else(|| {
+            claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+                api_key: "test-key".to_string(),
+                ..Default::default()
+            })
+            .expect("build test client")
+        });
 
-        let config = Config { provider: Some("mockprov".to_string()), hooks, ..Default::default() };
+        let config = Config {
+            provider: (!raw_anthropic).then(|| "mockprov".to_string()),
+            hooks,
+            ..Default::default()
+        };
         let ctx = ToolContext {
             working_dir: std::env::temp_dir(),
             permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: Arc::new(FixedHandler(permission)),
             cost_tracker: claurst_core::cost::CostTracker::new(),
             session_id: "hook-loop-test".to_string(),
-            file_history: Arc::new(parking_lot::Mutex::new(claurst_core::file_history::FileHistory::new())),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
             current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
@@ -5057,17 +6288,27 @@ mod hook_loop_tests {
             batch_rejection: Default::default(),
         };
 
+        let dir = tempfile::tempdir().unwrap();
+        let session = claurst_core::history::ConversationSession::new("mock-model".to_string());
         let query_config = QueryConfig {
             model: "mock-model".to_string(),
             max_turns: 6,
-            provider_registry: Some(Arc::new(registry)),
+            provider_registry: (!raw_anthropic).then(|| Arc::new(registry)),
+            session_journal: Some(claurst_core::session_journal::SessionJournal::new(
+                dir.path(),
+                &session,
+            )),
             is_subagent,
             ..Default::default()
         };
 
         let inputs = Arc::new(StdMutex::new(Vec::new()));
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecTool { inputs: inputs.clone(), nested })];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecTool {
+            inputs: inputs.clone(),
+            nested,
+        })];
         let mut messages = vec![Message::user("start")];
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             run_query_loop(
@@ -5077,7 +6318,7 @@ mod hook_loop_tests {
                 &ctx,
                 &query_config,
                 claurst_core::cost::CostTracker::new(),
-                None,
+                Some(tx),
                 tokio_util::sync::CancellationToken::new(),
                 None,
             ),
@@ -5087,7 +6328,23 @@ mod hook_loop_tests {
 
         let tool_inputs = inputs.lock().unwrap().clone();
         let requests = *requests.lock().unwrap();
-        Run { outcome, history: serde_json::to_string(&messages).unwrap(), tool_inputs, requests }
+        let persisted = claurst_core::session_journal::load(dir.path(), &session.id)
+            .unwrap()
+            .session
+            .messages;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        Run {
+            outcome,
+            history: serde_json::to_string(&messages).unwrap(),
+            tool_inputs,
+            requests,
+            messages,
+            persisted,
+            events,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5096,13 +6353,28 @@ mod hook_loop_tests {
         let stop_log = dir.path().join("stop.log");
         let mut hooks = HookMap::new();
         on(&mut hooks, HookEvent::Stop, None, log_payload(&stop_log));
-        on(&mut hooks, HookEvent::SubagentStop, None, log_payload(&stop_log));
+        on(
+            &mut hooks,
+            HookEvent::SubagentStop,
+            None,
+            log_payload(&stop_log),
+        );
 
-        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("finished")], PermissionDecision::Allow, false).await;
+        let run = drive(
+            hooks,
+            vec![Step::Tool("{}"), Step::Text("finished")],
+            PermissionDecision::Allow,
+            false,
+        )
+        .await;
 
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
         let payloads = read_payloads(&stop_log);
-        assert_eq!(payloads.len(), 1, "one Stop for one finished turn: {payloads:?}");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "one Stop for one finished turn: {payloads:?}"
+        );
         assert_eq!(payloads[0]["hook_event_name"], "Stop");
         assert_eq!(payloads[0]["session_id"], "hook-loop-test");
         assert_eq!(payloads[0]["stop_hook_active"], false);
@@ -5115,9 +6387,20 @@ mod hook_loop_tests {
         let stop_log = dir.path().join("stop.log");
         let mut hooks = HookMap::new();
         on(&mut hooks, HookEvent::Stop, None, log_payload(&stop_log));
-        on(&mut hooks, HookEvent::SubagentStop, None, log_payload(&stop_log));
+        on(
+            &mut hooks,
+            HookEvent::SubagentStop,
+            None,
+            log_payload(&stop_log),
+        );
 
-        drive(hooks, vec![Step::Text("sub done")], PermissionDecision::Allow, true).await;
+        drive(
+            hooks,
+            vec![Step::Text("sub done")],
+            PermissionDecision::Allow,
+            true,
+        )
+        .await;
 
         let payloads = read_payloads(&stop_log);
         assert_eq!(payloads.len(), 1, "{payloads:?}");
@@ -5140,10 +6423,20 @@ mod hook_loop_tests {
             ),
         );
 
-        let run = drive(hooks, vec![Step::Text("first"), Step::Text("second")], PermissionDecision::Allow, false).await;
+        let run = drive(
+            hooks,
+            vec![Step::Text("first"), Step::Text("second")],
+            PermissionDecision::Allow,
+            false,
+        )
+        .await;
 
         assert_eq!(run.requests, 2, "a blocked stop continues the loop once");
-        assert!(run.history.contains("Stop hook feedback: run the tests"), "{}", run.history);
+        assert!(
+            run.history.contains("Stop hook feedback: run the tests"),
+            "{}",
+            run.history
+        );
         let payloads = read_payloads(&stop_log);
         assert_eq!(payloads.len(), 2);
         assert_eq!(payloads[0]["stop_hook_active"], false);
@@ -5157,20 +6450,47 @@ mod hook_loop_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pre_tool_use_deny_blocks_the_call() {
         let mut hooks = HookMap::new();
-        on(&mut hooks, HookEvent::PreToolUse, Some("rec_tool"), "echo 'not today' >&2; exit 2".into());
+        on(
+            &mut hooks,
+            HookEvent::PreToolUse,
+            Some("rec_tool"),
+            "echo 'not today' >&2; exit 2".into(),
+        );
 
-        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+        let run = drive(
+            hooks,
+            vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")],
+            PermissionDecision::Allow,
+            false,
+        )
+        .await;
 
         assert!(run.tool_inputs.is_empty(), "denied tool must not run");
-        assert!(run.history.contains("Blocked by PreToolUse hook: not today"), "{}", run.history);
+        assert!(
+            run.history
+                .contains("Blocked by PreToolUse hook: not today"),
+            "{}",
+            run.history
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn matcher_that_does_not_select_the_tool_leaves_it_alone() {
         let mut hooks = HookMap::new();
-        on(&mut hooks, HookEvent::PreToolUse, Some("Edit|Write"), "exit 2".into());
+        on(
+            &mut hooks,
+            HookEvent::PreToolUse,
+            Some("Edit|Write"),
+            "exit 2".into(),
+        );
 
-        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+        let run = drive(
+            hooks,
+            vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")],
+            PermissionDecision::Allow,
+            false,
+        )
+        .await;
 
         assert_eq!(run.tool_inputs, vec![serde_json::json!({"x": 1})]);
     }
@@ -5180,7 +6500,12 @@ mod hook_loop_tests {
         let dir = tempfile::tempdir().unwrap();
         let post_log = dir.path().join("post.log");
         let mut hooks = HookMap::new();
-        on(&mut hooks, HookEvent::PreToolUse, None, r#"echo '{"updatedInput":{"x":2}}'"#.into());
+        on(
+            &mut hooks,
+            HookEvent::PreToolUse,
+            None,
+            r#"echo '{"updatedInput":{"x":2}}'"#.into(),
+        );
         on(
             &mut hooks,
             HookEvent::PostToolUse,
@@ -5191,7 +6516,13 @@ mod hook_loop_tests {
             ),
         );
 
-        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+        let run = drive(
+            hooks,
+            vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")],
+            PermissionDecision::Allow,
+            false,
+        )
+        .await;
 
         assert_eq!(run.tool_inputs, vec![serde_json::json!({"x": 2})]);
         let post = read_payloads(&post_log);
@@ -5200,23 +6531,54 @@ mod hook_loop_tests {
         assert_eq!(post[0]["tool_name"], "rec_tool");
         assert_eq!(post[0]["tool_input"], serde_json::json!({"x": 2}));
         assert_eq!(post[0]["tool_response"]["content"], "rec ran");
-        assert!(run.history.contains("PostToolUse hook context:\\nlint clean"), "{}", run.history);
+        assert!(
+            run.history
+                .contains("PostToolUse hook context:\\nlint clean"),
+            "{}",
+            run.history
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn hook_allow_skips_the_prompt_but_not_a_denial() {
         let mut allow_hooks = HookMap::new();
-        on(&mut allow_hooks, HookEvent::PreToolUse, None, r#"echo '{"decision":"allow"}'"#.into());
+        on(
+            &mut allow_hooks,
+            HookEvent::PreToolUse,
+            None,
+            r#"echo '{"decision":"allow"}'"#.into(),
+        );
 
         // The policy would ask (a hard denial when non-interactive): the
         // hook's allow answers the prompt.
-        let ask = PermissionDecision::Ask { reason: "policy asks".into() };
-        let run = drive(allow_hooks.clone(), vec![Step::Tool("{}"), Step::Text("ok")], ask, false).await;
-        assert_eq!(run.tool_inputs.len(), 1, "allow must answer the permission prompt");
+        let ask = PermissionDecision::Ask {
+            reason: "policy asks".into(),
+        };
+        let run = drive(
+            allow_hooks.clone(),
+            vec![Step::Tool("{}"), Step::Text("ok")],
+            ask,
+            false,
+        )
+        .await;
+        assert_eq!(
+            run.tool_inputs.len(),
+            1,
+            "allow must answer the permission prompt"
+        );
 
         // An explicit policy denial still wins.
-        let run = drive(allow_hooks, vec![Step::Tool("{}"), Step::Text("ok")], PermissionDecision::Deny, false).await;
-        assert!(run.tool_inputs.is_empty(), "allow must not override a denial");
+        let run = drive(
+            allow_hooks,
+            vec![Step::Tool("{}"), Step::Text("ok")],
+            PermissionDecision::Deny,
+            false,
+        )
+        .await;
+        assert!(
+            run.tool_inputs.is_empty(),
+            "allow must not override a denial"
+        );
     }
 
     /// A hook allowing a call (say, `Agent`) approves that call's own
@@ -5225,14 +6587,31 @@ mod hook_loop_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn hook_allow_does_not_approve_nested_tool_calls() {
         let mut hooks = HookMap::new();
-        on(&mut hooks, HookEvent::PreToolUse, Some("rec_tool"), r#"echo '{"decision":"allow"}'"#.into());
+        on(
+            &mut hooks,
+            HookEvent::PreToolUse,
+            Some("rec_tool"),
+            r#"echo '{"decision":"allow"}'"#.into(),
+        );
 
-        let ask = PermissionDecision::Ask { reason: "policy asks".into() };
-        let run = drive_nested(hooks, vec![Step::Tool("{}"), Step::Text("ok")], ask, false, Some("Bash")).await;
+        let ask = PermissionDecision::Ask {
+            reason: "policy asks".into(),
+        };
+        let run = drive_nested(
+            hooks,
+            vec![Step::Tool("{}"), Step::Text("ok")],
+            ask,
+            false,
+            Some("Bash"),
+        )
+        .await;
 
         assert_eq!(
             run.tool_inputs,
-            vec![serde_json::json!({}), serde_json::json!({ "nested_allowed": false })],
+            vec![
+                serde_json::json!({}),
+                serde_json::json!({ "nested_allowed": false })
+            ],
             "the allowed tool runs; its nested Bash prompt is still denied non-interactively"
         );
     }
@@ -5240,24 +6619,174 @@ mod hook_loop_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn hook_ask_prompts_even_when_policy_allows() {
         let mut hooks = HookMap::new();
-        on(&mut hooks, HookEvent::PreToolUse, None, r#"echo '{"decision":"ask","reason":"double-check"}'"#.into());
+        on(
+            &mut hooks,
+            HookEvent::PreToolUse,
+            None,
+            r#"echo '{"decision":"ask","reason":"double-check"}'"#.into(),
+        );
 
         // Non-interactive: the forced prompt cannot be answered, so it denies.
-        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("ok")], PermissionDecision::Allow, false).await;
+        let run = drive(
+            hooks,
+            vec![Step::Tool("{}"), Step::Text("ok")],
+            PermissionDecision::Allow,
+            false,
+        )
+        .await;
 
-        assert!(run.tool_inputs.is_empty(), "ask must not run the tool unprompted");
+        assert!(
+            run.tool_inputs.is_empty(),
+            "ask must not run the tool unprompted"
+        );
         assert!(run.history.contains("double-check"), "{}", run.history);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn post_model_turn_deny_stops_before_tools_run() {
         let mut hooks = HookMap::new();
-        on(&mut hooks, HookEvent::PostModelTurn, None, "echo 'budget' >&2; exit 2".into());
+        on(
+            &mut hooks,
+            HookEvent::PostModelTurn,
+            None,
+            "echo 'budget' >&2; exit 2".into(),
+        );
 
-        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("never")], PermissionDecision::Allow, false).await;
+        let run = drive(
+            hooks,
+            vec![Step::Tool("{}"), Step::Text("never")],
+            PermissionDecision::Allow,
+            false,
+        )
+        .await;
 
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
         assert!(run.tool_inputs.is_empty());
         assert_eq!(run.requests, 1);
+        assert_vetoed_tools_answered(&run, 1);
+    }
+
+    fn assert_vetoed_tools_answered(run: &Run, count: usize) {
+        let tool_ids: Vec<_> = run
+            .messages
+            .iter()
+            .flat_map(Message::get_tool_use_blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_ids.len(), count);
+        let results = run.messages.last().unwrap().get_tool_result_blocks();
+        assert_eq!(results.len(), count);
+        for (block, id) in results.iter().zip(tool_ids) {
+            assert!(matches!(block,
+                ContentBlock::ToolResult { tool_use_id, content: ToolResultContent::Text(text), is_error: Some(true) }
+                    if tool_use_id == id && text.contains("Blocked by PostModelTurn hook: budget")));
+        }
+        assert_eq!(
+            serde_json::to_value(&run.messages).unwrap(),
+            serde_json::to_value(&run.persisted).unwrap()
+        );
+        let committed: Vec<_> = run
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                QueryEvent::MessageCommitted(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            committed.len(),
+            2,
+            "assistant and rejected results must both reach the UI"
+        );
+        assert_eq!(committed[1].get_tool_result_blocks().len(), count);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| matches!(event,
+            QueryEvent::ToolEnd { is_error: true, result, .. } if result.contains("budget")))
+                .count(),
+            count
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_model_turn_deny_answers_raw_anthropic_tool_calls() {
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let mut events = vec![
+                json!({"type":"message_start","message":{"id":"msg_veto","type":"message","role":"assistant","model":"mock-model","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+            ];
+            for index in 0..2 {
+                events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":format!("tool_{index}"),"name":"rec_tool","input":{}}}));
+                events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":"{}"}}));
+                events.push(json!({"type":"content_block_stop","index":index}));
+            }
+            events.push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}));
+            events.push(json!({"type":"message_stop"}));
+            let body: String = events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".into(),
+            api_base: format!("http://{address}"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut hooks = HookMap::new();
+        on(
+            &mut hooks,
+            HookEvent::PostModelTurn,
+            None,
+            "echo 'budget' >&2; exit 2".into(),
+        );
+        let run = drive_with_client(
+            hooks,
+            Vec::new(),
+            PermissionDecision::Allow,
+            false,
+            None,
+            Some(client),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(run.tool_inputs.is_empty());
+        assert_vetoed_tools_answered(&run, 2);
     }
 }

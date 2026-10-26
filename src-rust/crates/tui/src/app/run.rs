@@ -40,6 +40,7 @@ pub(super) async fn load_session_entries() -> Vec<SessionEntry> {
                 title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
                 last_updated,
                 cost_usd: s.total_cost,
+                working_dir: s.working_dir,
             }
         })
         .collect()
@@ -608,6 +609,7 @@ impl App {
                         self.handle_paste_data(data);
                         self.refresh_prompt_input();
                     }
+                    Event::Resize(width, _) => self.handle_terminal_resize(width),
                     Event::Mouse(mouse_event) => {
                         self.handle_mouse_event(mouse_event);
                     }

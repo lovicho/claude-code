@@ -168,6 +168,17 @@ title, last-updated time, message count, and cost. In the overlay:
 
 ---
 
+### /sessions
+
+Open the session browser overlay with an optional pre-applied filter. While the browser is open, press `/` to type a filter live, `Ctrl+U` to clear it, and `Esc` to close. Matching is case-insensitive against the session title and id.
+
+```
+/sessions
+/sessions <query>
+```
+
+---
+
 ### /fork
 
 Save the conversation up to message index N (default: all of it) as a new session titled "Fork of ...", with the current session as its parent. The current session stays active; switch with `/resume <id>`.
@@ -354,6 +365,49 @@ YOLO mode can also be enabled persistently via `"yoloMode": true` in the
 `config` block of the global settings file. That field is global-only: a
 project settings file cannot enable it. Same root/sudo guard as
 `--dangerously-skip-permissions` applies.
+
+---
+
+### ! — shell commands
+
+Enable `config.bangCommands.enabled` in global settings, then submit
+`!command` to execute a shell command directly. The command is not sent to
+the model. Bang commands are disabled in plan mode; project settings cannot
+enable them.
+
+```json
+{"config":{"bangCommands":{"enabled":true,"showInTranscript":true}}}
+```
+
+Each invocation starts a fresh shell (`bash` on Unix, `cmd` on Windows).
+One command runs at a time, with a 60-second deadline. Large output keeps
+bounded head/tail windows (about 100 KiB) and a path to the complete saved
+output. Timeout output is labelled partial. Set `showInTranscript` to
+`false` to hide the command/output annotation.
+
+---
+
+### /poke
+
+Toggle auto-poke. When enabled, Claurst sends a continuation prompt
+automatically when the model stops a turn with incomplete todos. Opt-in:
+auto-poke is OFF by default.
+
+```
+/poke          — toggle auto-poke on/off
+/poke on       — enable auto-poke
+/poke off      — disable auto-poke
+/poke status   — show enabled state, poke budget, and incomplete count
+```
+
+Safety rails:
+- Only fires after a clean `end_turn` stop. Esc-aborted turns, `max_tokens`
+  truncation, and provider refusals never auto-poke.
+- Budget of 48 pokes per session.
+- Stops after 3 consecutive turns with no todo-state change.
+
+Setting persists to `~/.claurst/settings.json` under `"autoPokeEnabled"`
+(default: `false`).
 
 ---
 
